@@ -171,63 +171,64 @@ static void LoadSettings() {
     }
 }
 
+// Writes the whole ini in one go. WritePrivateProfileString rewrites the file on every call, which
+// with ~50 keys per profile stalled the UI on each click. Temp file + rename, so a crash can't truncate it.
 static void Save() {
     Config c;
     { std::lock_guard<std::mutex> l(mu); c = cfg; }
-    FILE* f;
-    if (GetFileAttributesW(ini) == INVALID_FILE_ATTRIBUTES && !_wfopen_s(&f, ini, L"wb")) {
-        fputwc(0xFEFF, f); // UTF-16 BOM makes the ini APIs keep non-ASCII profile names
-        fclose(f);
-    }
-    auto put = [](const wchar_t* sec, const wchar_t* k, double v) {
+    std::wstring out = L"\xFEFF"; // UTF-16 BOM makes the ini APIs keep non-ASCII profile names
+    auto sec = [&](const wchar_t* name) { out += L"["; out += name; out += L"]\r\n"; };
+    auto str = [&](const wchar_t* k, const wchar_t* v) { out += k; out += L"="; out += v; out += L"\r\n"; };
+    auto put = [&](const wchar_t* k, double v) {
         wchar_t buf[32];
         swprintf_s(buf, L"%g", v);
-        WritePrivateProfileStringW(sec, k, buf, ini);
+        str(k, buf);
     };
-    put(L"general", L"profiles", c.n);
-    put(L"general", L"profile", c.cur);
-    put(L"general", L"toggleKey", c.toggleKey);
-    put(L"general", L"nextKey", c.nextKey);
-    put(L"general", L"prevKey", c.prevKey);
-    put(L"general", L"sens", c.sens);
-    put(L"general", L"enabled", c.enabled);
-    put(L"general", L"onTop", c.onTop);
-    put(L"general", L"spamOn", c.spamOn);
-    put(L"general", L"notify", c.notify);
-    put(L"general", L"spamPull", c.spamPull);
-    put(L"general", L"wheelKey", c.wheelKey);
-    put(L"general", L"spamTrigger", c.spamTrigger);
-    put(L"general", L"spamRequire", c.spamRequire);
-    put(L"general", L"spamKey", c.spamKey);
-    put(L"general", L"spamRate", c.spamRate);
-    put(L"general", L"spamDelay", c.spamDelay);
-    put(L"general", L"spamDelayOff", c.spamDelayOff);
-    put(L"general", L"spamJitter", c.spamJitter);
-    put(L"general", L"pauseKey", c.pauseKey);
-    put(L"general", L"sound", c.sound);
-    put(L"general", L"accent", c.accent);
-    WritePrivateProfileStringW(L"general", L"port", c.port, ini);
-    static int written = MAX_PROFILES; // sections that may exist on disk; first save sweeps them all
-    int upto = std::max(c.n, written);
-    written = c.n;
-    for (int i = 0; i < upto; i++) {
-        wchar_t sec[16];
-        swprintf_s(sec, L"profile%d", i + 1);
-        if (i >= c.n) { // drop sections of deleted profiles
-            WritePrivateProfileStringW(sec, nullptr, nullptr, ini);
-            continue;
-        }
+    sec(L"general");
+    put(L"profiles", c.n);
+    put(L"profile", c.cur);
+    put(L"toggleKey", c.toggleKey);
+    put(L"nextKey", c.nextKey);
+    put(L"prevKey", c.prevKey);
+    put(L"sens", c.sens);
+    put(L"enabled", c.enabled);
+    put(L"onTop", c.onTop);
+    put(L"spamOn", c.spamOn);
+    put(L"notify", c.notify);
+    put(L"spamPull", c.spamPull);
+    put(L"wheelKey", c.wheelKey);
+    put(L"spamTrigger", c.spamTrigger);
+    put(L"spamRequire", c.spamRequire);
+    put(L"spamKey", c.spamKey);
+    put(L"spamRate", c.spamRate);
+    put(L"spamDelay", c.spamDelay);
+    put(L"spamDelayOff", c.spamDelayOff);
+    put(L"spamJitter", c.spamJitter);
+    put(L"pauseKey", c.pauseKey);
+    put(L"sound", c.sound);
+    put(L"accent", c.accent);
+    str(L"port", c.port);
+    for (int i = 0; i < c.n; i++) {
+        wchar_t name[16];
+        swprintf_s(name, L"profile%d", i + 1);
+        sec(name);
         const Profile& p = c.p[i];
-        WritePrivateProfileStringW(sec, L"name", p.name, ini);
-        put(sec, L"holdKey", p.holdKey);
-        put(sec, L"requireKey", p.requireKey);
-        put(sec, L"hotkey", p.hotkey);
-        put(sec, L"mode", p.mode);
-        for (auto& d : fields) put(sec, d.key, p.*d.f);
-        for (auto& d : growDefs) put(sec, d.key, p.*d.f);
-        for (auto& d : swayDefs) put(sec, d.key, p.*d.f);
-        ForSwitches([&](const FieldDef& d) { put(sec, (std::wstring(d.key) + L"Off").c_str(), p.off[d.bit]); });
+        str(L"name", p.name);
+        put(L"holdKey", p.holdKey);
+        put(L"requireKey", p.requireKey);
+        put(L"hotkey", p.hotkey);
+        put(L"mode", p.mode);
+        ForFields([&](const FieldDef& d) { put(d.key, p.*d.f); });
+        ForSwitches([&](const FieldDef& d) { put((std::wstring(d.key) + L"Off").c_str(), p.off[d.bit]); });
     }
+    std::wstring tmp = std::wstring(ini) + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD wr;
+    bool ok = WriteFile(h, out.data(), (DWORD)(out.size() * sizeof(wchar_t)), &wr, nullptr);
+    CloseHandle(h);
+    if (ok) MoveFileExW(tmp.c_str(), ini, MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileW(tmp.c_str());
 }
 
 // One-line text form of a profile, for sharing through the clipboard. The name goes last so it may
@@ -430,9 +431,13 @@ static void Engine(HWND hwnd) {
     int spamVk = 0;         // key currently pressed by spam (0 = none)
     bool spamWas = false;
     double spamSince = -1; // when the spam keys went down (-1 = not held)
+    Config c;
+    { std::lock_guard<std::mutex> l(mu); c = cfg; }
     for (;;) {
-        Config c;
-        { std::lock_guard<std::mutex> l(mu); c = cfg; }
+        { // never wait on the UI while it draws a frame: a missed tick stutters the pull; last tick's copy will do
+            std::unique_lock<std::mutex> l(mu, std::try_to_lock);
+            if (l) c = cfg;
+        }
         bool cap = capturing;
 
         // global hotkeys: on/off, next profile, per-profile jump
@@ -587,7 +592,7 @@ static ID2D1SolidColorBrush *br, *hbr, *obr;
 static HWND wheelWnd, toastWnd;
 static IDWriteTextFormat *fTitle, *fSection, *fLabel, *fValue, *fSmall, *fPill;
 
-static struct { float mx = -1, my = -1, wheel = 0; bool down = false, pressed = false, rpressed = false; } in;
+static struct { float mx = -1, my = -1, px = -1, wheel = 0; bool down = false, pressed = false, rpressed = false, dbl = false; } in; // px: x at the last press
 static void* active;        // slider being dragged
 static int* bindTarget;     // key slot waiting for a key press
 static wchar_t* editTarget; // text field being typed into (profile name or COM port)
@@ -627,6 +632,189 @@ static void Text(const wchar_t* s, D2D1_RECT_F r, IDWriteTextFormat* f, UINT32 c
     f->SetTextAlignment(al);
     Color(c);
     rt->DrawText(s, (UINT32)wcslen(s), f, r, br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
+static void CopyText(const std::wstring& s) {
+    if (!OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        CopyMemory(GlobalLock(g), s.c_str(), bytes);
+        GlobalUnlock(g);
+        if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+    }
+    CloseClipboard();
+}
+
+static std::wstring PasteText() {
+    std::wstring s;
+    if (!OpenClipboard(hwnd)) return s;
+    if (HANDLE g = GetClipboardData(CF_UNICODETEXT))
+        if (auto* t = (const wchar_t*)GlobalLock(g)) {
+            s = t;
+            GlobalUnlock(g);
+        }
+    CloseClipboard();
+    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n')) s.pop_back();
+    return s;
+}
+
+// ---------- text editing (name fields and typed slider values) ----------
+
+static int caret, anchor;  // caret and the other end of the selection, as indexes into editTarget
+static ULONGLONG caretAt;  // last caret move: the caret shows solid right after one, then blinks
+static bool selecting;     // a mouse drag is extending the selection
+
+static bool CaretVisible() { return editTarget && (GetTickCount64() - caretAt) % 1060 < 530; }
+static bool WordCh(wchar_t c) { return iswalnum(c) || c == L'_'; }
+static int WordLeft(const wchar_t* s, int i) {
+    while (i > 0 && !WordCh(s[i - 1])) i--;
+    while (i > 0 && WordCh(s[i - 1])) i--;
+    return i;
+}
+static int WordRight(const wchar_t* s, int i, int n) {
+    while (i < n && !WordCh(s[i])) i++;
+    while (i < n && WordCh(s[i])) i++;
+    return i;
+}
+
+static void SetSel(int a, int c) { // anchor, caret
+    int n = (int)wcslen(editTarget);
+    anchor = std::clamp(a, 0, n);
+    caret = std::clamp(c, 0, n);
+    caretAt = GetTickCount64();
+}
+
+// Replace [a, b) of the text being edited with ins (filtered to what the field accepts, cut to fit).
+static void Replace(int a, int b, std::wstring ins) {
+    std::wstring s = editTarget;
+    a = std::clamp(a, 0, (int)s.size());
+    b = std::clamp(b, a, (int)s.size());
+    std::wstring t;
+    for (wchar_t ch : ins)
+        if (ch >= 32 && ch != 127 && (editTarget != numBuf || iswdigit(ch) || ch == '-' || ch == '.')) t += ch;
+    if (t.empty() && !ins.empty()) return; // nothing usable typed: keep the selection
+    t.resize(std::min(t.size(), (size_t)std::max(0, editMax - ((int)s.size() - (b - a)))));
+    s.replace(a, b - a, t);
+    wcscpy_s(editTarget, editMax + 1, s.c_str());
+    SetSel(a + (int)t.size(), a + (int)t.size());
+}
+
+static float TextWidth(const wchar_t* s, int n) {
+    IDWriteTextLayout* tl;
+    DWRITE_TEXT_METRICS m;
+    float w = 0;
+    if (SUCCEEDED(dw->CreateTextLayout(s, n, fValue, 10000, 100, &tl))) {
+        if (SUCCEEDED(tl->GetMetrics(&m))) w = m.widthIncludingTrailingWhitespace;
+        tl->Release();
+    }
+    return w;
+}
+
+// Screen x of caret position i, for the text being edited drawn in r.
+static float CaretX(D2D1_RECT_F r, DWRITE_TEXT_ALIGNMENT al, int i) {
+    float x = r.left + TextWidth(editTarget, i);
+    if (al == DWRITE_TEXT_ALIGNMENT_TRAILING) x += r.right - r.left - TextWidth(editTarget, (int)wcslen(editTarget));
+    return x;
+}
+
+static int HitPos(D2D1_RECT_F r, DWRITE_TEXT_ALIGNMENT al, float x) { // nearest caret position to x
+    int n = (int)wcslen(editTarget), best = 0;
+    float bestD = 1e9f;
+    for (int i = 0; i <= n; i++) {
+        float d = std::fabs(CaretX(r, al, i) - x);
+        if (d < bestD) bestD = d, best = i;
+    }
+    return best;
+}
+
+// Mouse on the field being edited: click places the caret, drag or shift+click selects, double-click
+// selects a word. hover = the click landed on this field.
+static void EditMouse(D2D1_RECT_F r, DWRITE_TEXT_ALIGNMENT al, bool hover) {
+    if (in.pressed && hover) {
+        int p = HitPos(r, al, in.px);
+        if (in.dbl) {
+            int a = p, b = p, n = (int)wcslen(editTarget);
+            while (a > 0 && WordCh(editTarget[a - 1])) a--;
+            while (b < n && WordCh(editTarget[b])) b++;
+            SetSel(a, b);
+        } else { // the caret goes to where the mouse is now: a fast drag may be over (or done) by this frame
+            SetSel(GetKeyState(VK_SHIFT) < 0 ? anchor : p, HitPos(r, al, in.mx));
+            selecting = true;
+        }
+    } else if (selecting && in.down) {
+        SetSel(anchor, HitPos(r, al, in.mx));
+    }
+    if (!in.down) selecting = false;
+}
+
+// The field being edited: text, selection highlight and blinking caret.
+static void DrawEdit(D2D1_RECT_F r, DWRITE_TEXT_ALIGNMENT al, UINT32 color) {
+    int n = (int)wcslen(editTarget), a = std::clamp(std::min(caret, anchor), 0, n), b = std::clamp(std::max(caret, anchor), 0, n);
+    float cy = (r.top + r.bottom) / 2;
+    if (a != b) {
+        float x1 = CaretX(r, al, a), x2 = CaretX(r, al, b);
+        Fill({x1, cy - 9, x2, cy + 9}, 2, ACCENT, .35f);
+    }
+    Text(editTarget, r, fValue, color, al);
+    if (CaretVisible()) {
+        float cx = std::min(CaretX(r, al, std::clamp(caret, 0, n)) + (al == DWRITE_TEXT_ALIGNMENT_TRAILING ? 0 : 1), r.right + 2);
+        Line(cx, cy - 8, cx, cy + 8, ACCENT, 1.5f);
+    }
+}
+
+// Keys that aren't characters: caret movement, delete and the clipboard. True if the text changed.
+static bool EditKey(int vk) {
+    wchar_t* s = editTarget;
+    int n = (int)wcslen(s), a = std::min(caret, anchor), b = std::max(caret, anchor);
+    bool shift = GetKeyState(VK_SHIFT) < 0, ctrl = GetKeyState(VK_CONTROL) < 0;
+    auto move = [&](int to) { SetSel(shift ? anchor : to, to); };
+    switch (vk) {
+    case VK_LEFT:
+        if (a != b && !shift) move(a);
+        else move(ctrl ? WordLeft(s, caret) : caret - 1);
+        break;
+    case VK_RIGHT:
+        if (a != b && !shift) move(b);
+        else move(ctrl ? WordRight(s, caret, n) : caret + 1);
+        break;
+    case VK_HOME: move(0); break;
+    case VK_END: move(n); break;
+    case VK_DELETE:
+        if (a == b) b = ctrl ? WordRight(s, caret, n) : std::min(n, caret + 1);
+        Replace(a, b, L"");
+        return true;
+    case 'A':
+        if (ctrl) SetSel(0, n);
+        break;
+    case 'C': case 'X':
+        if (!ctrl || a == b) break;
+        CopyText(std::wstring(s + a, s + b));
+        if (vk == 'X') {
+            Replace(a, b, L"");
+            return true;
+        }
+        break;
+    case 'V':
+        if (!ctrl) break;
+        {
+            std::wstring t = PasteText();
+            Replace(a, b, t.substr(0, t.find_first_of(L"\r\n")));
+        }
+        return true;
+    }
+    return false;
+}
+
+// Characters from WM_CHAR: typing replaces the selection; Backspace (Ctrl = a word) erases.
+static void EditChar(wchar_t ch) {
+    int a = std::min(caret, anchor), b = std::max(caret, anchor);
+    if (ch == VK_BACK || ch == 127) {
+        if (a == b) a = ch == 127 ? WordLeft(editTarget, caret) : std::max(0, caret - 1);
+        Replace(a, b, L"");
+    } else if (ch >= 32) {
+        Replace(a, b, std::wstring(1, ch));
+    }
 }
 
 static bool Button(D2D1_RECT_F r) {
@@ -681,19 +869,26 @@ static void Slider(const FieldDef& d, float& v, float x, float y, float w, bool*
 
     // click the value to type an exact number; Enter or click away applies, Esc cancels
     D2D1_RECT_F vr = R(x + w - std::min(120.f, w / 2), y, std::min(120.f, w / 2), 20);
-    bool vHover = In(vr);
+    bool vHover = In(vr), mine = numTarget == &v && editTarget == numBuf;
+    D2D1_RECT_F er = R(x, y, w, 20); // typed text sits where the value was, right-aligned
     if (vHover) cursor = IDC_IBEAM;
-    if (in.pressed && vHover) {
+    if (in.pressed && vHover && !mine) { // start typing with the whole value selected
         if (numTarget && !numCancel && *numBuf && editTarget == numBuf) *numTarget = (float)_wtof(numBuf);
         numTarget = &v;
         swprintf_s(numBuf, L"%g", v);
         editTarget = numBuf;
         editMax = 10;
         numCancel = false;
+        selecting = false;
+        SetSel(0, (int)wcslen(numBuf));
         SyncCapture();
-    } else if (in.pressed && numTarget == &v && editTarget == numBuf) {
-        editTarget = nullptr;
-        SyncCapture();
+    } else if (mine) {
+        if (in.pressed && !vHover) {
+            editTarget = nullptr;
+            SyncCapture();
+        } else {
+            EditMouse(er, DWRITE_TEXT_ALIGNMENT_TRAILING, vHover);
+        }
     }
     bool typing = numTarget == &v;
     if (typing) {
@@ -712,8 +907,7 @@ static void Slider(const FieldDef& d, float& v, float x, float y, float w, bool*
 
     bool hot = hover || active == &v || vHover;
     wchar_t buf[32];
-    if (typing) wcscpy_s(buf, numBuf);
-    else if ((v == 0 || dim) && d.zero) wcscpy_s(buf, d.zero);
+    if ((v == 0 || dim) && d.zero) wcscpy_s(buf, d.zero);
     else swprintf_s(buf, d.fmt, v);
     if (off) {
         Fill(sw, 8, dim ? TRACK : ACCENT);
@@ -721,8 +915,8 @@ static void Slider(const FieldDef& d, float& v, float x, float y, float w, bool*
     }
     float lx = off ? x + 38 : x;
     Text(d.label, R(lx, y, x + w - lx, 20), fLabel, dim ? MUTED : TEXT);
-    Text(buf, R(x, y, w, 20), fValue, hot || typing ? ACCENT : dim ? DISABLED : MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    if (typing) Line(x + w + 3, y + 3, x + w + 3, y + 17, ACCENT, 1.5f);
+    if (typing) DrawEdit(er, DWRITE_TEXT_ALIGNMENT_TRAILING, ACCENT);
+    else Text(buf, er, fValue, hot ? ACCENT : dim ? DISABLED : MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     UINT32 fill = dim ? DISABLED : ACCENT;
     float f = (v - d.lo) / (d.hi - d.lo), z = d.lo < 0 ? -d.lo / (d.hi - d.lo) : 0; // bipolar ranges fill from 0
@@ -782,27 +976,25 @@ static void Segment(const wchar_t* label, int& v, const wchar_t* const (&opts)[N
 static void NameField(wchar_t* val, int max, D2D1_RECT_F r, const wchar_t* placeholder, const wchar_t* hint) {
     bool hover = In(r);
     if (hover) cursor = IDC_IBEAM;
+    D2D1_RECT_F tr = R(r.left + 12, r.top, r.right - r.left - 24, r.bottom - r.top);
     if (in.pressed) { // click in → edit this field; click out → stop if it was ours
-        if (hover) { editTarget = val; editMax = max; }
-        else if (editTarget == val) editTarget = nullptr;
+        if (hover && editTarget != val) {
+            editTarget = val;
+            editMax = max;
+        } else if (!hover && editTarget == val) {
+            editTarget = nullptr;
+        }
         SyncCapture();
     }
     bool editing = editTarget == val;
+    if (editing) EditMouse(tr, DWRITE_TEXT_ALIGNMENT_LEADING, hover);
     Fill(r, 8, editing || hover ? BTN_HOVER : BTN);
     Stroke(r, 8, editing ? ACCENT : BORDER, editing ? 1.5f : 1);
-    D2D1_RECT_F tr = R(r.left + 12, r.top, r.right - r.left - 24, r.bottom - r.top);
-    Text(*val || editing ? val : placeholder, tr, fValue, *val ? TEXT : MUTED);
     if (editing) {
-        IDWriteTextLayout* tl;
-        fValue->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        dw->CreateTextLayout(val, (UINT32)wcslen(val), fValue, 1000, tr.bottom - tr.top, &tl);
-        DWRITE_TEXT_METRICS m;
-        tl->GetMetrics(&m);
-        tl->Release();
-        float cx = tr.left + m.widthIncludingTrailingWhitespace + 1;
-        Line(cx, r.top + 9, cx, r.bottom - 9, ACCENT, 1.5f);
-    } else if (hover && hint) {
-        Text(hint, tr, fSmall, MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        DrawEdit(tr, DWRITE_TEXT_ALIGNMENT_LEADING, TEXT);
+    } else {
+        Text(*val ? val : placeholder, tr, fValue, *val ? TEXT : MUTED);
+        if (hover && hint) Text(hint, tr, fSmall, MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
 }
 
@@ -843,31 +1035,6 @@ static void Preview(const Profile& p, double scale, float x, float y, float w, f
     Text(buf, R(x, y + h + 8, w, 20), fSmall, MUTED);
     swprintf_s(buf, L"over %.2f s", T / 1000);
     Text(buf, R(x, y + h + 28, w, 20), fSmall, MUTED);
-}
-
-static void CopyText(const std::wstring& s) {
-    if (!OpenClipboard(hwnd)) return;
-    EmptyClipboard();
-    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
-    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-        CopyMemory(GlobalLock(g), s.c_str(), bytes);
-        GlobalUnlock(g);
-        if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
-    }
-    CloseClipboard();
-}
-
-static std::wstring PasteText() {
-    std::wstring s;
-    if (!OpenClipboard(hwnd)) return s;
-    if (HANDLE g = GetClipboardData(CF_UNICODETEXT))
-        if (auto* t = (const wchar_t*)GlobalLock(g)) {
-            s = t;
-            GlobalUnlock(g);
-        }
-    CloseClipboard();
-    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n')) s.pop_back();
-    return s;
 }
 
 static wchar_t toastReq[64]; // toast to show once the frame is done (the overlay can't draw mid-frame)
@@ -1104,7 +1271,7 @@ static void Paint() {
         Frame(rt->GetSize().width);
         onTop = cfg.onTop;
     }
-    in.pressed = in.rpressed = false;
+    in.pressed = in.rpressed = in.dbl = false;
     in.wheel = 0;
     if (rt->EndDraw() == D2DERR_RECREATE_TARGET) {
         hbr->Release();
@@ -1275,9 +1442,22 @@ static void DrawWheel(float w, float) {
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
-// Timer 2 (~60 Hz): open/update/close the wheel, fade out the toast.
+// Raw mouse motion steers the wheel. Only subscribed while it's open: a high-rate gaming mouse
+// would otherwise send the UI thread thousands of messages a second for nothing.
+static void RawMouse(bool on) {
+    RAWINPUTDEVICE rid{1, 2, (DWORD)(on ? RIDEV_INPUTSINK : RIDEV_REMOVE), on ? hwnd : nullptr}; // generic desktop / mouse
+    RegisterRawInputDevices(&rid, 1, sizeof rid);
+}
+
+static bool caretShown;
+
+// Timer 2 (~60 Hz): open/update/close the wheel, fade out the toast, blink the text caret.
 static void OverlayTick() {
     ULONGLONG now = GetTickCount64();
+    if (CaretVisible() != caretShown) {
+        caretShown = !caretShown;
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
     if (toastAt && now - toastAt > 1800) {
         ShowWindow(toastWnd, SW_HIDE);
         toastAt = 0;
@@ -1291,6 +1471,7 @@ static void OverlayTick() {
     bool held = Down(key) && !capturing;
     if (held && !wheelOpen) {
         wheelOpen = true;
+        RawMouse(true);
         wheelX = wheelY = wheelOpenT = 0;
         std::fill(std::begin(wheelHl), std::end(wheelHl), 0.f);
     }
@@ -1312,6 +1493,7 @@ static void OverlayTick() {
         return;
     }
     wheelOpen = false;
+    RawMouse(false);
     ShowWindow(wheelWnd, SW_HIDE);
     if (wheelSel < 0) return;
     wchar_t msg[64];
@@ -1354,7 +1536,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK: // stands in for the second click's down, so it still presses whatever is under it
         in.down = in.pressed = true;
+        in.dbl = msg == WM_LBUTTONDBLCLK;
+        in.px = GET_X_LPARAM(lp) * Scale(); // the frame may run after the mouse has moved on (fast drag-select)
         SetCapture(h);
         InvalidateRect(h, nullptr, FALSE);
         return 0;
@@ -1377,26 +1562,30 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         SetCursor(LoadCursor(nullptr, cursor));
         return TRUE;
 
-    case WM_CHAR: { // typing into a text field (profile name or COM port)
+    case WM_CHAR: { // typing into a text field (profile name, COM port or a slider value)
         if (!editTarget) break;
         {
             std::lock_guard<std::mutex> l(mu);
-            wchar_t* s = editTarget;
-            size_t len = wcslen(s);
-            if (wp == VK_BACK) {
-                if (len) s[len - 1] = 0;
-            } else if (wp == VK_RETURN || wp == VK_ESCAPE) {
+            if (wp == VK_RETURN || wp == VK_ESCAPE) {
                 numCancel = wp == VK_ESCAPE;
                 editTarget = nullptr;
-            } else if (s == numBuf && !iswdigit((wint_t)wp) && wp != '-' && wp != '.') {
-                // number fields take digits, sign and point only
-            } else if (wp >= 32 && len < (size_t)editMax) {
-                s[len] = (wchar_t)wp;
-                s[len + 1] = 0;
+            } else {
+                EditChar((wchar_t)wp);
             }
         }
         SyncCapture();
-        Save();
+        saveReq = true;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    }
+    case WM_KEYDOWN: { // caret keys, Delete, Ctrl+A/C/X/V in a text field
+        if (!editTarget) break;
+        bool changed;
+        {
+            std::lock_guard<std::mutex> l(mu);
+            changed = EditKey((int)wp);
+        }
+        if (changed) saveReq = true;
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     }
@@ -1405,6 +1594,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER: {
         if (wp == 2) {
             OverlayTick();
+            return 0;
+        }
+        if (wp == 3) {
+            KillTimer(h, 3);
+            Save();
             return 0;
         }
         int pressed = 0;
@@ -1468,9 +1662,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         BeginPaint(h, &ps);
         Paint();
         EndPaint(h, &ps);
-        if (saveReq) {
+        if (saveReq) { // saved once things settle, not on every click, scroll step or keystroke
             saveReq = false;
-            Save();
+            SetTimer(h, 3, 500, nullptr);
         }
         if (*toastReq) {
             Notify(toastReq, toastReqColor);
@@ -1493,6 +1687,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_DESTROY:
+        if (KillTimer(h, 3)) Save(); // a save was still pending
         PostQuitMessage(0);
         return 0;
     }
@@ -1526,6 +1721,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     WNDCLASSW wc{};
     wc.lpfnWndProc = WndProc;
+    wc.style = CS_DBLCLKS; // double-click selects a word in text fields
     wc.hInstance = inst;
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     wc.lpszClassName = L"MouseDown";
@@ -1548,8 +1744,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     for (HWND* w : {&wheelWnd, &toastWnd}) // click-through, never takes focus from the game
         *w = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                              L"MouseDownOverlay", L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
-    RAWINPUTDEVICE rid{1, 2, RIDEV_INPUTSINK, hwnd}; // generic desktop / mouse, delivered in the background too
-    RegisterRawInputDevices(&rid, 1, sizeof rid);
     SetTimer(hwnd, 2, 16, nullptr);
 
     std::thread(HookThread).detach();

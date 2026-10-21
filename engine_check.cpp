@@ -76,5 +76,25 @@ int main() {
     assert(b.vy == 123 && b.sway == 40 && b.off[9] && b.mode == 2 && b.holdKey == VK_LBUTTON);
     assert(!wcscmp(b.name, L"A;b=c") && b.hotkey == 7);
     assert(!ImportProfile(L"garbage", b) && b.vy == 123);
+
+    // Settings survive a save and load, non-ASCII names and deleted profiles included
+    GetTempPathW(MAX_PATH, ini);
+    wcscat_s(ini, L"engine_check.ini");
+    cfg.n = 3, cfg.cur = 2, cfg.prevKey = VK_F6, cfg.accent = 3, cfg.spamJitter = 12;
+    cfg.p[1] = a;
+    wcscpy_s(cfg.p[0].name, L"Spray ü");
+    wcscpy_s(cfg.port, L"COM7");
+    Save();
+    cfg.n = 2;
+    Save();
+    wchar_t gone[16];
+    GetPrivateProfileStringW(L"profile3", L"name", L"none", gone, 16, ini);
+    assert(!wcscmp(gone, L"none")); // the deleted profile's section is gone
+    cfg = Config{};
+    LoadSettings();
+    assert(cfg.n == 2 && cfg.cur == 1 && cfg.prevKey == VK_F6 && cfg.accent == 3 && cfg.spamJitter == 12);
+    assert(cfg.p[1].vy == 123 && cfg.p[1].off[9] && !wcscmp(cfg.p[1].name, L"A;b=c") && !wcscmp(cfg.port, L"COM7"));
+    assert(!wcscmp(cfg.p[0].name, L"Spray ü"));
+    DeleteFileW(ini);
     puts("engine ok");
 }
