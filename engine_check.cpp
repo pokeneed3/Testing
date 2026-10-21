@@ -51,5 +51,20 @@ int main() {
     assert(e.growEvery == 0 && p.growEvery == 100);
     Target(e, 1, 50 + 600, tx, ty);
     assert(ty == 200);
+
+    // Horizontal sway: ±sway px/s on x, one full cycle per swayMs
+    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
+    Profile w;
+    w.vy = 0, w.vx = 0, w.sway = 50, w.swayMs = 400;
+    Target(w, 1, 100, tx, ty);
+    assert(near(tx, 50) && ty == 0);        // quarter cycle: peak +
+    Target(w, 1, 300, tx, ty);
+    assert(near(tx, -50));                   // three-quarter cycle: peak -
+    Target(w, 1, 200, tx, ty);
+    assert(near(tx, 0));                     // half cycle: zero crossing
+    w.off[9] = true;                         // the switch zeroes sway, keeping its value
+    Profile we = Effective(w);
+    Target(we, 1, 100, tx, ty);
+    assert(tx == 0 && we.sway == 0 && w.sway == 50);
     puts("engine ok");
 }

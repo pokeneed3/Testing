@@ -27,7 +27,7 @@
 
 // ---------- settings ----------
 
-const int MAX_PROFILES = 100, NAME_LEN = 20, OFF_BITS = 9; // ponytail: fixed array keeps the per-tick config copy allocation-free
+const int MAX_PROFILES = 100, NAME_LEN = 20, OFF_BITS = 10; // ponytail: fixed array keeps the per-tick config copy allocation-free
 
 struct Profile {
     wchar_t name[NAME_LEN + 4] = L"Default";
@@ -35,11 +35,12 @@ struct Profile {
     float vy = 300, vx = 0, jitter = 0, randMin = 15, randMax = 30, startDelay = 0, ramp = 0, smoothing = 0, duration = 0, tickHz = 500;
     float vy2 = 300, vx2 = 0, at2 = 0, vy3 = 300, vx3 = 0, at3 = 0; // stages 2/3: pull from atN ms on (0 = off)
     float growEvery = 0, growY = 0, growX = 0; // every growEvery ms held, pull gains growY/growX px/s (0 = off)
+    float sway = 0, swayMs = 500; // horizontal sway: ±sway px/s, one full cycle every swayMs (0 = off)
     bool off[OFF_BITS] = {}; // per-feature switch (FieldDef::bit); off acts like the value is 0, keeping the value
 };
 struct Config {
     Profile p[MAX_PROFILES];
-    int n = 1, cur = 0, toggleKey = VK_F8, nextKey = 0;
+    int n = 1, cur = 0, toggleKey = VK_F8, nextKey = 0, prevKey = 0;
     int spamTrigger = 0, spamRequire = 0, spamKey = 0; // hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
     int wheelKey = 0; // hold to show the profile wheel
     float sens = 100, spamRate = 10, spamDelay = 0; // spamDelay: ms the spam keys must be held before clicking
@@ -74,17 +75,23 @@ static const FieldDef growDefs[] = { // own card, so kept out of fields[]'s layo
     {L"growY", L"Vertical", L"%+.0f", nullptr, &Profile::growY, -200, 200, 1},
     {L"growX", L"Horizontal", L"%+.0f", nullptr, &Profile::growX, -200, 200, 1},
 };
+static const FieldDef swayDefs[] = { // own pair, kept out of fields[] so its indices don't shift
+    {L"sway", L"Sway", L"±%.0f px/s", L"Off", &Profile::sway, 0, 400, 1, 9},
+    {L"swayMs", L"Sway period", L"%.0f ms", nullptr, &Profile::swayMs, 100, 3000, 10},
+};
 static const FieldDef sensDef = {L"sens", L"Sensitivity", L"%.0f%%", nullptr, nullptr, 10, 300, 5};
 static const FieldDef spamDef = {L"spamRate", L"Rate", L"%.0f /s", nullptr, nullptr, 1, 50, 1};
 static const FieldDef spamDelayDef = {L"spamDelay", L"Delay", L"%.0f ms", L"Instant", nullptr, 0, 2000, 10};
 const int STAGE_FIELDS = 8, PULL_FIELDS = 11; // fields[] layout: 8 stage fields, jitter, offset min/max, then Timing
 const double SPAM_HOLD_MS = 15; // how long each spam click stays pressed (shorter at high rates)
 const double TAP_MS = 150;    // tap-mode pull length when Pull duration is Unlimited
+const double SWAY_TAU = 6.283185307179586; // 2π, for the horizontal sway oscillation
 
 // Visit every profile field that has an on/off switch.
 template <class F> static void ForSwitches(F fn) {
     for (auto& d : fields) if (d.bit >= 0) fn(d);
     for (auto& d : growDefs) if (d.bit >= 0) fn(d);
+    for (auto& d : swayDefs) if (d.bit >= 0) fn(d);
 }
 
 // The profile as the engine sees it: switched-off features read as 0.
@@ -110,6 +117,7 @@ static void LoadSettings() {
     cfg.cur = std::min((int)get(L"general", L"profile", 0, 0, MAX_PROFILES - 1), cfg.n - 1);
     cfg.toggleKey = (int)get(L"general", L"toggleKey", cfg.toggleKey, 0, 254);
     cfg.nextKey = (int)get(L"general", L"nextKey", cfg.nextKey, 0, 254);
+    cfg.prevKey = (int)get(L"general", L"prevKey", cfg.prevKey, 0, 254);
     cfg.sens = (float)get(L"general", L"sens", cfg.sens, sensDef.lo, sensDef.hi);
     cfg.enabled = get(L"general", L"enabled", 1, 0, 1) != 0;
     cfg.onTop = get(L"general", L"onTop", 0, 0, 1) != 0;
@@ -136,6 +144,7 @@ static void LoadSettings() {
         p.mode = (int)get(sec, L"mode", p.mode, 0, 2);
         for (auto& d : fields) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : growDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
+        for (auto& d : swayDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         ForSwitches([&](const FieldDef& d) {
             p.off[d.bit] = get(sec, (std::wstring(d.key) + L"Off").c_str(), 0, 0, 1) != 0;
         });
@@ -159,6 +168,7 @@ static void Save() {
     put(L"general", L"profile", c.cur);
     put(L"general", L"toggleKey", c.toggleKey);
     put(L"general", L"nextKey", c.nextKey);
+    put(L"general", L"prevKey", c.prevKey);
     put(L"general", L"sens", c.sens);
     put(L"general", L"enabled", c.enabled);
     put(L"general", L"onTop", c.onTop);
@@ -191,6 +201,7 @@ static void Save() {
         put(sec, L"mode", p.mode);
         for (auto& d : fields) put(sec, d.key, p.*d.f);
         for (auto& d : growDefs) put(sec, d.key, p.*d.f);
+        for (auto& d : swayDefs) put(sec, d.key, p.*d.f);
         ForSwitches([&](const FieldDef& d) { put(sec, (std::wstring(d.key) + L"Off").c_str(), p.off[d.bit]); });
     }
 }
@@ -303,7 +314,8 @@ static void Target(const Profile& p, double scale, double t, double& tx, double&
         vx += (float)(k * p.growX);
         vy += (float)(k * p.growY);
     }
-    tx = vx * f;
+    double sway = p.swayMs > 0 && p.sway != 0 ? p.sway * std::sin(SWAY_TAU * te / p.swayMs) : 0;
+    tx = (vx + sway) * f;
     ty = vy * f;
 }
 
@@ -338,7 +350,7 @@ static void Engine(HWND hwnd) {
     auto ms = [&](LONGLONG ticks) { return ticks * 1000.0 / freq.QuadPart; };
 
     HANDLE serial = INVALID_HANDLE_VALUE;
-    bool wasActive = false, toggleWas = false, nextWas = false;
+    bool wasActive = false, toggleWas = false, nextWas = false, prevWas = false;
     Trigger trig;
     bool hotWas[MAX_PROFILES] = {};
     int lastCur = -1;
@@ -360,6 +372,7 @@ static void Engine(HWND hwnd) {
         }
         int newCur = c.cur;
         if (edge(c.nextKey, nextWas)) newCur = (c.cur + 1) % c.n;
+        if (edge(c.prevKey, prevWas)) newCur = (c.cur + c.n - 1) % c.n;
         for (int i = 0; i < c.n; i++)
             if (edge(c.p[i].hotkey, hotWas[i])) newCur = i;
         if (newCur != c.cur) {
@@ -484,7 +497,7 @@ enum : UINT32 {
     ACCENT = 0x7C6CFF, ACCENT_SOFT = 0xD8D4FF, GREEN = 0x3DDC97, TEAL = 0x38BDF8, TRACK = 0x2A2F3B,
     BTN = 0x1D212A, BTN_HOVER = 0x272C38, RED = 0xE5484D, RED_SOFT = 0x3A1F24, WHITE = 0xFFFFFF,
 };
-const float WIN_W = 1260, WIN_H = 780, HEADER = 56;
+const float WIN_W = 1260, WIN_H = 830, HEADER = 56;
 const D2D1_RECT_F PILL = {132, 17, 216, 39};
 
 static HWND hwnd;
@@ -713,7 +726,7 @@ static void NameField(wchar_t* val, int max, D2D1_RECT_F r, const wchar_t* place
 
 // Runs the same model as the engine (minus jitter) and plots speed over time.
 static void Preview(const Profile& p, double scale, float x, float y, float w, float h) {
-    float T = p.startDelay + (p.duration > 0 ? p.duration + 200 : std::max({p.ramp, p.at2, p.at3, p.growEvery * 4}) + 600);
+    float T = p.startDelay + (p.duration > 0 ? p.duration + 200 : std::max({p.ramp, p.at2, p.at3, p.growEvery * 4, p.sway ? p.swayMs * 2 : 0}) + 600);
     const int N = 100;
     float sy[N + 1], sx[N + 1], lo = 0, hi = 0;
     double vx = 0, vy = 0, totX = 0, totY = 0;
@@ -739,7 +752,7 @@ static void Preview(const Profile& p, double scale, float x, float y, float w, f
     Line(x, Y(0), x + w, Y(0), MUTED, 1, .5f);
     for (int i = 0; i < N; i++) {
         float x1 = x + w * i / N, x2 = x + w * (i + 1) / N;
-        if (p.vx) Line(x1, Y(sx[i]), x2, Y(sx[i + 1]), TEAL, 2);
+        if (p.vx || p.sway) Line(x1, Y(sx[i]), x2, Y(sx[i + 1]), TEAL, 2);
         Line(x1, Y(sy[i]), x2, Y(sy[i + 1]), ACCENT, 2);
     }
 
@@ -845,7 +858,7 @@ static void Frame(float W) {
         Fill(R(193, ty, 3, th), 1.5f, MUTED, .5f);
     }
 
-    Card(20, 426, 180, 334, L"CURVE");
+    Card(20, 426, 180, 386, L"CURVE");
     Circle(150, 447, 3.5f, ACCENT);
     Text(L"y", R(156, 438, 12, 18), fSmall, MUTED);
     Circle(170, 447, 3.5f, TEAL);
@@ -867,19 +880,20 @@ static void Frame(float W) {
     Segment(L"Activation", p.mode, modes, 236, 240, 268);
     KeyBind(L"Profile hotkey", p.hotkey, 236, 284, 268);
 
-    Card(220, 348, 300, 412, L"GENERAL");
+    Card(220, 348, 300, 464, L"GENERAL");
     KeyBind(L"On / off", cfg.toggleKey, 236, 384, 268);
     KeyBind(L"Next profile", cfg.nextKey, 236, 428, 268);
-    Slider(sensDef, cfg.sens, 236, 474, 268);
-    Toggle(L"Always on top", cfg.onTop, 236, 532, 268);
-    Text(L"HID port", R(236, 574, 128, 34), fLabel, TEXT);
-    NameField(cfg.port, 15, R(368, 574, 136, 34), L"SendInput", L"blank = inject");
+    KeyBind(L"Prev profile", cfg.prevKey, 236, 472, 268);
+    Slider(sensDef, cfg.sens, 236, 518, 268);
+    Toggle(L"Always on top", cfg.onTop, 236, 576, 268);
+    Text(L"HID port", R(236, 620, 128, 34), fLabel, TEXT);
+    NameField(cfg.port, 15, R(368, 620, 136, 34), L"SendInput", L"blank = inject");
 
     // right column
     // Pull: stage tabs pick which stage's sliders show; stage 1 runs from activation
     static int stage;
     static const wchar_t* const stages[] = {L"1", L"2", L"3"};
-    Card(540, 116, 380, 336, L"PULL");
+    Card(540, 116, 380, 386, L"PULL");
     Segment(L"Spray stage", stage, stages, 556, 152, 348);
     for (int s = 1; s < 3; s++) { // green dot over stages that are on
         float at = s == 1 ? (p.off[6] ? 0 : p.at2) : (p.off[7] ? 0 : p.at3);
@@ -896,10 +910,12 @@ static void Frame(float W) {
     PS(fields[STAGE_FIELDS], 556, 346, 348); // jitter
     PS(fields[STAGE_FIELDS + 1], 556, 396, 164); // offset min/max: both switches flip the same flag
     PS(fields[STAGE_FIELDS + 2], 740, 396, 164);
+    PS(swayDefs[0], 556, 452, 164); // sway amplitude (its switch) + period
+    PS(swayDefs[1], 740, 452, 164);
 
-    Card(540, 464, 380, 296, L"TIMING & SMOOTHING");
+    Card(540, 516, 380, 296, L"TIMING & SMOOTHING");
     for (int i = PULL_FIELDS; i < (int)std::size(fields); i++)
-        PS(fields[i], 556, 500 + (i - PULL_FIELDS) * 50.f, 348);
+        PS(fields[i], 556, 552 + (i - PULL_FIELDS) * 50.f, 348);
 
     // far right column
     Card(940, 116, 300, 312, L"AUTO SPAM");
@@ -915,7 +931,7 @@ static void Frame(float W) {
     KeyBind(L"Hold for wheel", cfg.wheelKey, 956, 476, 268);
     Toggle(L"Notifications", cfg.notify, 956, 520, 268);
 
-    Card(940, 582, 300, 178, L"PULL GROWTH", L"px/s per step");
+    Card(940, 582, 300, 230, L"PULL GROWTH", L"px/s per step");
     PS(growDefs[0], 956, 618, 268);
     Slider(growDefs[1], p.*growDefs[1].f, 956, 676, 126);
     Slider(growDefs[2], p.*growDefs[2].f, 1098, 676, 126);
