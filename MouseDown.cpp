@@ -42,6 +42,9 @@ struct Config {
     Profile p[MAX_PROFILES];
     int n = 1, cur = 0, toggleKey = VK_F8, nextKey = 0, prevKey = 0;
     int pauseKey = 0; // held: pull and spam are suspended
+    int lastKey = 0;  // jump back to the profile used before this one
+    int quickKey = 0; // held: 1-9 picks that profile, the mouse wheel steps through them
+    bool hud = false; // small always-on-top readout of the active profile
     bool sound = false; // beep on on/off and profile switches
     int accent = 0; // UI colour, index into accents[]
     int spamTrigger = 0, spamRequire = 0, spamKey = 0; // hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
@@ -74,10 +77,10 @@ static const FieldDef fields[] = {
     {L"duration", L"Pull duration", L"%.0f ms", L"Unlimited", &Profile::duration, 0, 5000, 50, 5},
     {L"tickHz", L"Update rate", L"%.0f Hz", nullptr, &Profile::tickHz, 100, 1000, 10},
 };
-static const FieldDef growDefs[] = { // own card, so kept out of fields[]'s layout
+static const FieldDef growDefs[] = { // own tab in the Pull card, so kept out of fields[]'s layout
     {L"growEvery", L"Grow every", L"%.0f ms", L"Off", &Profile::growEvery, 0, 2000, 10, 8},
-    {L"growY", L"Vertical", L"%+.0f", nullptr, &Profile::growY, -200, 200, 1},
-    {L"growX", L"Horizontal", L"%+.0f", nullptr, &Profile::growX, -200, 200, 1},
+    {L"growY", L"Vertical per step", L"%+.0f px/s", nullptr, &Profile::growY, -200, 200, 1},
+    {L"growX", L"Horizontal per step", L"%+.0f px/s", nullptr, &Profile::growX, -200, 200, 1},
 };
 static const FieldDef swayDefs[] = { // own pair, kept out of fields[] so its indices don't shift
     {L"sway", L"Sway", L"±%.0f px/s", L"Off", &Profile::sway, 0, 400, 1, 9},
@@ -119,7 +122,7 @@ static Profile Effective(const Profile& p) {
 
 static std::mutex mu; // guards cfg between the UI thread and the engine thread
 static Config cfg;
-static std::atomic<bool> capturing{false}, pulling{false}; // capturing: UI is grabbing keys, engine ignores them
+static std::atomic<bool> capturing{false}, pulling{false}, pausedNow{false}; // capturing: UI is grabbing keys, engine ignores them
 static wchar_t ini[MAX_PATH];
 
 static void LoadSettings() {
@@ -151,6 +154,9 @@ static void LoadSettings() {
     cfg.pauseKey = (int)get(L"general", L"pauseKey", cfg.pauseKey, 0, 254);
     cfg.sound = get(L"general", L"sound", 0, 0, 1) != 0;
     cfg.accent = (int)get(L"general", L"accent", 0, 0, ACCENTS - 1);
+    cfg.lastKey = (int)get(L"general", L"lastKey", cfg.lastKey, 0, 254);
+    cfg.quickKey = (int)get(L"general", L"quickKey", cfg.quickKey, 0, 254);
+    cfg.hud = get(L"general", L"hud", 0, 0, 1) != 0;
     GetPrivateProfileStringW(L"general", L"port", L"", cfg.port, 16, ini);
     for (int i = 0; i < cfg.n; i++) {
         wchar_t sec[16], def[16];
@@ -207,6 +213,9 @@ static void Save() {
     put(L"pauseKey", c.pauseKey);
     put(L"sound", c.sound);
     put(L"accent", c.accent);
+    put(L"lastKey", c.lastKey);
+    put(L"quickKey", c.quickKey);
+    put(L"hud", c.hud);
     str(L"port", c.port);
     for (int i = 0; i < c.n; i++) {
         wchar_t name[16];
@@ -288,21 +297,66 @@ enum { EV_ON = 1, EV_OFF, EV_PROFILE }; // wParam of WM_APP + 1
 static std::atomic<bool> phys[256];
 static std::atomic<bool> hooked;
 
+// Quick switching. The hooks only flag what was asked for (they must return fast); the engine applies it.
+static std::atomic<int> quickKeyNow;          // engine keeps this at cfg.quickKey (0 while capturing keys)
+static std::atomic<int> quickJump{-1};        // profile index picked with quick key + 1-9
+static std::atomic<int> quickStep, wheelStep; // mouse wheel steps: quick key held / profile wheel open
+static std::atomic<bool> wheelShown, wheelClick; // profile wheel is open / it got a left click
+static bool Down(int vk);
+
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
+    static bool eatLUp; // the left press went to the wheel, so its release must too
     auto* m = (MSLLHOOKSTRUCT*)lp;
-    if (code == HC_ACTION && !(m->flags & LLMHF_INJECTED)) switch (wp) {
+    if (code == HC_ACTION && !(m->flags & LLMHF_INJECTED)) {
+        if (wp == WM_LBUTTONDOWN && wheelShown) { // picks on the wheel, never fires in the game
+            wheelClick = eatLUp = true;
+            return 1;
+        }
+        if (wp == WM_LBUTTONUP && eatLUp) {
+            eatLUp = false;
+            return 1;
+        }
+        if (wp == WM_MOUSEWHEEL) {
+            int dir = (short)HIWORD(m->mouseData) > 0 ? -1 : 1; // scroll down = next profile
+            if (wheelShown) {
+                wheelStep += dir;
+                return 1;
+            }
+            int q = quickKeyNow;
+            if (q && Down(q)) {
+                quickStep += dir;
+                return 1;
+            }
+        }
+        switch (wp) {
         case WM_LBUTTONDOWN: case WM_LBUTTONUP: phys[VK_LBUTTON] = wp == WM_LBUTTONDOWN; break;
         case WM_RBUTTONDOWN: case WM_RBUTTONUP: phys[VK_RBUTTON] = wp == WM_RBUTTONDOWN; break;
         case WM_MBUTTONDOWN: case WM_MBUTTONUP: phys[VK_MBUTTON] = wp == WM_MBUTTONDOWN; break;
         case WM_XBUTTONDOWN: case WM_XBUTTONUP:
             phys[HIWORD(m->mouseData) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2] = wp == WM_XBUTTONDOWN; break;
         }
+    }
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
 static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
+    static bool eaten[256]; // digits that went to quick switch: their release is eaten too
     auto* k = (KBDLLHOOKSTRUCT*)lp;
-    if (code == HC_ACTION && !(k->flags & LLKHF_INJECTED)) phys[k->vkCode & 255] = !(k->flags & LLKHF_UP);
+    if (code == HC_ACTION && !(k->flags & LLKHF_INJECTED)) {
+        int vk = k->vkCode & 255, q = quickKeyNow;
+        bool down = !(k->flags & LLKHF_UP);
+        int digit = vk >= '1' && vk <= '9' ? vk - '1' : vk >= VK_NUMPAD1 && vk <= VK_NUMPAD9 ? vk - VK_NUMPAD1 : -1;
+        if (down && digit >= 0 && q && q != vk && Down(q)) {
+            quickJump = digit;
+            eaten[vk] = true;
+            return 1;
+        }
+        if (!down && eaten[vk]) {
+            eaten[vk] = false;
+            return 1;
+        }
+        phys[vk] = down;
+    }
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
@@ -423,7 +477,8 @@ static void Engine(HWND hwnd) {
     auto ms = [&](LONGLONG ticks) { return ticks * 1000.0 / freq.QuadPart; };
 
     HANDLE serial = INVALID_HANDLE_VALUE;
-    bool wasActive = false, toggleWas = false, nextWas = false, prevWas = false;
+    bool wasActive = false, toggleWas = false, nextWas = false, prevWas = false, backWas = false;
+    int seenCur = -1, backCur = -1; // profile in use before the current one, for the last-profile key
     Trigger trig;
     bool hotWas[MAX_PROFILES] = {};
     int lastCur = -1;
@@ -439,8 +494,13 @@ static void Engine(HWND hwnd) {
             if (l) c = cfg;
         }
         bool cap = capturing;
+        if (c.cur != seenCur) { // however it changed (hotkey, wheel, a click in the UI)
+            if (seenCur >= 0) backCur = seenCur;
+            seenCur = c.cur;
+        }
+        quickKeyNow = cap ? 0 : c.quickKey;
 
-        // global hotkeys: on/off, next profile, per-profile jump
+        // global hotkeys: on/off, next / previous / last profile, quick switch, per-profile jump
         auto edge = [&](int vk, bool& was) { bool d = Down(vk), e = d && !was && !cap; was = d; return e; };
         int event = 0;
         if (edge(c.toggleKey, toggleWas)) {
@@ -450,6 +510,10 @@ static void Engine(HWND hwnd) {
         int newCur = c.cur;
         if (edge(c.nextKey, nextWas)) newCur = (c.cur + 1) % c.n;
         if (edge(c.prevKey, prevWas)) newCur = (c.cur + c.n - 1) % c.n;
+        if (edge(c.lastKey, backWas) && backCur >= 0 && backCur < c.n) newCur = backCur;
+        int jump = quickJump.exchange(-1), step = quickStep.exchange(0);
+        if (jump >= 0 && jump < c.n) newCur = jump;
+        if (step) newCur = ((newCur + step) % c.n + c.n) % c.n;
         for (int i = 0; i < c.n; i++)
             if (edge(c.p[i].hotkey, hotWas[i])) newCur = i;
         if (newCur != c.cur) {
@@ -471,6 +535,10 @@ static void Engine(HWND hwnd) {
 
         // spam first, so a linked pull starts on the same tick as the first click
         bool paused = Down(c.pauseKey) && !cap;
+        if (paused != pausedNow) {
+            pausedNow = paused;
+            PostMessageW(hwnd, WM_APP, 0, 0);
+        }
         bool spamKeys = c.enabled && c.spamOn && !cap && !paused && c.spamKey && Down(c.spamTrigger) &&
                         (!c.spamRequire || Down(c.spamRequire));
         if (!spamKeys) spamSince = -1;
@@ -572,7 +640,7 @@ static void Engine(HWND hwnd) {
 
 enum : UINT32 {
     BG = 0x0E1014, CARD = 0x161920, BORDER = 0x252A35, TEXT = 0xE8EAF0, MUTED = 0x868D9C, DISABLED = 0x4A5060,
-    GREEN = 0x3DDC97, TEAL = 0x38BDF8, TRACK = 0x2A2F3B,
+    GREEN = 0x3DDC97, TEAL = 0x38BDF8, TRACK = 0x2A2F3B, ORANGE = 0xF59E0B,
     BTN = 0x1D212A, BTN_HOVER = 0x272C38, RED = 0xE5484D, RED_SOFT = 0x3A1F24, WHITE = 0xFFFFFF,
 };
 static const UINT32 accents[ACCENTS][2] = { // accent, soft tint for text on it
@@ -589,7 +657,7 @@ static ID2D1HwndRenderTarget* hrt;   // main window
 static ID2D1DCRenderTarget* dcrt;     // overlays (wheel, toast)
 static ID2D1RenderTarget* rt;         // whichever one is drawing now
 static ID2D1SolidColorBrush *br, *hbr, *obr;
-static HWND wheelWnd, toastWnd;
+static HWND wheelWnd, toastWnd, hudWnd;
 static IDWriteTextFormat *fTitle, *fSection, *fLabel, *fValue, *fSmall, *fPill;
 
 static struct { float mx = -1, my = -1, px = -1, wheel = 0; bool down = false, pressed = false, rpressed = false, dbl = false; } in; // px: x at the last press
@@ -1086,15 +1154,15 @@ static void Frame(float W) {
 
     // header: title, clickable status pill, window buttons
     Text(L"Mouse Down", R(20, 0, 200, HEADER), fTitle, TEXT);
-    bool pull = pulling;
-    UINT32 sc = !cfg.enabled ? MUTED : pull ? GREEN : ACCENT;
+    bool pull = pulling, paused = pausedNow;
+    UINT32 sc = !cfg.enabled ? MUTED : paused ? ORANGE : pull ? GREEN : ACCENT;
     if (Button(PILL)) {
         cfg.enabled = !cfg.enabled;
         saveReq = true;
     }
     Fill(PILL, 11, sc, In(PILL) ? .24f : .14f);
     Circle(PILL.left + 13, PILL.top + 11, 3.5f, sc);
-    Text(!cfg.enabled ? L"OFF" : pull ? L"PULLING" : L"READY", R(PILL.left + 23, PILL.top, 60, 22), fPill, sc);
+    Text(!cfg.enabled ? L"OFF" : paused ? L"PAUSED" : pull ? L"PULLING" : L"READY", R(PILL.left + 23, PILL.top, 60, 22), fPill, sc);
 
     D2D1_RECT_F minB = R(W - 96, 10, 38, 36), closeB = R(W - 52, 10, 38, 36);
     if (In(minB)) Fill(minB, 8, BTN_HOVER);
@@ -1108,7 +1176,7 @@ static void Frame(float W) {
     // sidebar: profile list + curve
     // profile list scrolls inside the card; follows the current profile when it changes elsewhere
     static float scroll;
-    static int shownCur = -1;
+    static int shownCur = -1, dragRow = -1; // dragRow: profile being dragged to a new place in the list
     const D2D1_RECT_F list = R(24, 94, 172, 314);
     const float listH = list.bottom - list.top - 8, maxScroll = std::max(0.f, (cfg.n + 1) * 38.f - 4 - listH);
     if (In(list) && in.wheel) scroll -= in.wheel * 38;
@@ -1125,11 +1193,13 @@ static void Frame(float W) {
         bool sel = cfg.cur == i, hover = In(r) && In(list);
         if (hover && Button(r)) {
             cfg.cur = i;
+            dragRow = i;
             saveReq = true;
         }
-        Fill(r, 8, sel ? ACCENT : hover ? BTN_HOVER : CARD);
+        Fill(r, 8, sel ? ACCENT : hover || dragRow == i ? BTN_HOVER : CARD);
+        if (i < 9) Text(std::to_wstring(i + 1).c_str(), R(r.left + 10, r.top, 14, 34), fSmall, sel ? ACCENT_SOFT : DISABLED);
         int hk = cfg.p[i].hotkey;
-        Text(*cfg.p[i].name ? cfg.p[i].name : L"Untitled", R(r.left + 12, r.top, hk ? 88.f : 140.f, 34), fLabel,
+        Text(*cfg.p[i].name ? cfg.p[i].name : L"Untitled", R(r.left + 26, r.top, hk ? 74.f : 126.f, 34), fLabel,
              sel ? WHITE : TEXT);
         if (hk) Text(KeyName(hk).c_str(), R(r.right - 64, r.top, 54, 34), fSmall, sel ? ACCENT_SOFT : MUTED,
                      DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -1174,14 +1244,14 @@ static void Frame(float W) {
 
     Card(220, 348, 300, 464, L"GENERAL");
     KeyBind(L"On / off", cfg.toggleKey, 236, 384, 268);
-    KeyBind(L"Next profile", cfg.nextKey, 236, 428, 268);
-    KeyBind(L"Prev profile", cfg.prevKey, 236, 472, 268);
-    Slider(sensDef, cfg.sens, 236, 518, 268);
-    Toggle(L"Always on top", cfg.onTop, 236, 576, 268);
-    Text(L"HID port", R(236, 620, 128, 34), fLabel, TEXT);
-    NameField(cfg.port, 15, R(368, 620, 136, 34), L"SendInput", L"blank = inject");
-    KeyBind(L"Hold to pause", cfg.pauseKey, 236, 664, 268);
-    Toggle(L"Sounds", cfg.sound, 236, 708, 268);
+    KeyBind(L"Hold to pause", cfg.pauseKey, 236, 428, 268);
+    Slider(sensDef, cfg.sens, 236, 474, 268);
+    Toggle(L"Always on top", cfg.onTop, 236, 532, 268);
+    Text(L"HID port", R(236, 576, 128, 34), fLabel, TEXT);
+    NameField(cfg.port, 15, R(368, 576, 136, 34), L"SendInput", L"blank = inject");
+    Toggle(L"Sounds", cfg.sound, 236, 620, 268);
+    Toggle(L"Notifications", cfg.notify, 236, 664, 268);
+    Toggle(L"In-game HUD", cfg.hud, 236, 708, 268);
     Text(L"Accent", R(236, 752, 120, 32), fLabel, TEXT);
     for (int k = 0; k < ACCENTS; k++) {
         float cx = 493 - (ACCENTS - 1 - k) * 28.f, cy = 768;
@@ -1197,23 +1267,28 @@ static void Frame(float W) {
     }
 
     // right column
-    // Pull: stage tabs pick which stage's sliders show; stage 1 runs from activation
+    // Pull: tabs pick which stage's sliders show (stage 1 runs from activation), or the growth ones
     static int stage;
-    static const wchar_t* const stages[] = {L"1", L"2", L"3"};
+    static const wchar_t* const stages[] = {L"1", L"2", L"3", L"Grow"};
     Card(540, 116, 380, 386, L"PULL");
     Segment(L"Spray stage", stage, stages, 556, 152, 348);
-    for (int s = 1; s < 3; s++) { // green dot over stages that are on
-        float at = s == 1 ? (p.off[6] ? 0 : p.at2) : (p.off[7] ? 0 : p.at3);
-        if (at > 0) Circle(556 + 348 - 3 * 58 - 3 + s * 58 + 50, 158, 3, GREEN);
+    const float segL = 556 + 348 - std::size(stages) * 58.f - 3; // left edge of the first tab
+    for (int s = 1; s < 4; s++) { // green dot over the tabs that are on
+        float on = s == 1 ? (p.off[6] ? 0 : p.at2) : s == 2 ? (p.off[7] ? 0 : p.at3) : (p.off[8] ? 0 : p.growEvery);
+        if (on > 0) Circle(segL + s * 58 + 50, 158, 3, GREEN);
     }
-    int base = stage ? 2 + (stage - 1) * 3 : 0;
     auto PS = [&](const FieldDef& d, float x, float y, float w) { // profile slider, with its switch if it has one
         Slider(d, p.*d.f, x, y, w, d.bit >= 0 ? &p.off[d.bit] : nullptr);
     };
-    PS(fields[base], 556, 196, 348);
-    PS(fields[base + 1], 556, 246, 348);
-    if (stage) PS(fields[base + 2], 556, 296, 348);
-    else Text(L"Runs from activation until stage 2 / 3 starts", R(556, 296, 348, 40), fSmall, MUTED);
+    if (stage == 3) {
+        for (int i = 0; i < 3; i++) PS(growDefs[i], 556, 196 + i * 50.f, 348);
+    } else {
+        int base = stage ? 2 + (stage - 1) * 3 : 0;
+        PS(fields[base], 556, 196, 348);
+        PS(fields[base + 1], 556, 246, 348);
+        if (stage) PS(fields[base + 2], 556, 296, 348);
+        else Text(L"Runs from activation until stage 2 / 3 starts", R(556, 296, 348, 40), fSmall, MUTED);
+    }
     PS(fields[STAGE_FIELDS], 556, 346, 348); // jitter
     PS(fields[STAGE_FIELDS + 1], 556, 396, 164); // offset min/max: both switches flip the same flag
     PS(fields[STAGE_FIELDS + 2], 740, 396, 164);
@@ -1235,14 +1310,14 @@ static void Frame(float W) {
     Toggle(L"Clicks trigger pull", cfg.spamPull, 956, 380, 268);
     Slider(spamJitterDef, cfg.spamJitter, 956, 426, 268);
 
-    Card(940, 490, 300, 130, L"OVERLAY");
-    KeyBind(L"Hold for wheel", cfg.wheelKey, 956, 526, 268);
-    Toggle(L"Notifications", cfg.notify, 956, 570, 268);
-
-    Card(940, 632, 300, 180, L"PULL GROWTH", L"px/s per step");
-    PS(growDefs[0], 956, 668, 268);
-    Slider(growDefs[1], p.*growDefs[1].f, 956, 726, 126);
-    Slider(growDefs[2], p.*growDefs[2].f, 1098, 726, 126);
+    Card(940, 490, 300, 322, L"SWITCHING");
+    KeyBind(L"Next profile", cfg.nextKey, 956, 526, 268);
+    KeyBind(L"Prev profile", cfg.prevKey, 956, 570, 268);
+    KeyBind(L"Last profile", cfg.lastKey, 956, 614, 268);
+    KeyBind(L"Quick switch", cfg.quickKey, 956, 658, 268);
+    KeyBind(L"Hold for wheel", cfg.wheelKey, 956, 702, 268);
+    Text(L"Hold Quick switch + 1–9, or + scroll", R(956, 748, 268, 18), fSmall, MUTED);
+    Text(L"Wheel: aim, scroll or click · drag list to reorder", R(956, 768, 268, 18), fSmall, MUTED);
 
     if (numTarget && !numSeen) { // its slider is gone (profile or stage switched): drop the edit
         numTarget = nullptr;
@@ -1250,6 +1325,22 @@ static void Frame(float W) {
         SyncCapture();
     }
     RunProfileCmd();
+
+    if (dragRow >= 0) { // after the frame, like RunProfileCmd, so nothing moves mid-draw
+        if (!in.down || dragRow >= cfg.n) {
+            dragRow = -1;
+        } else {
+            int to = std::clamp((int)std::floor((in.my - 98 + scroll) / 38), 0, cfg.n - 1);
+            if (to != dragRow) cursor = IDC_SIZENS;
+            for (; dragRow < to; dragRow++) std::swap(cfg.p[dragRow], cfg.p[dragRow + 1]);
+            for (; dragRow > to; dragRow--) std::swap(cfg.p[dragRow], cfg.p[dragRow - 1]);
+            if (cfg.cur != dragRow) {
+                cfg.cur = dragRow;
+                saveReq = true;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
+    }
 }
 
 static void Paint() {
@@ -1430,7 +1521,7 @@ static void DrawWheel(float w, float) {
     wchar_t stats[48];
     swprintf_s(stats, L"↓%.0f  →%.0f", p.vy, p.vx);
     Text(stats, R(c - 62, c - 4, 124, 18), fSmall, MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
-    Text(wheelSel < 0 ? L"move to pick" : wheelSel == cfg.cur ? L"current" : L"release", R(c - 62, c + 14, 124, 18),
+    Text(wheelSel < 0 ? L"aim or scroll" : wheelSel == cfg.cur ? L"current" : L"release or click", R(c - 62, c + 14, 124, 18),
          fSmall, wheelSel >= 0 && wheelSel != cfg.cur ? ACCENT : DISABLED, DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // pointer: arc on the hub edge facing the mouse direction
@@ -1451,7 +1542,54 @@ static void RawMouse(bool on) {
 
 static bool caretShown;
 
-// Timer 2 (~60 Hz): open/update/close the wheel, fade out the toast, blink the text caret.
+// In-game HUD: active profile, its number and status, in the corner of the game's monitor.
+// Redrawn only when something on it changes.
+static wchar_t hudName[NAME_LEN + 4], hudSub[32];
+static UINT32 hudColor;
+const float HUD_W = 250, HUD_H = 40;
+
+static void DrawHud(float w, float h) {
+    Fill(R(0, 0, w, h), 10, CARD, .9f);
+    Stroke(R(0, 0, w, h), 10, BORDER);
+    Circle(18, h / 2, 5, hudColor);
+    Text(hudName, R(32, 0, w - 140, h), fValue, TEXT);
+    Text(hudSub, R(w - 112, 0, 100, h), fSmall, MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+}
+
+static void UpdateHud() {
+    static bool shown;
+    static LONG atX, atY;
+    bool on, hud;
+    wchar_t name[NAME_LEN + 4], sub[32];
+    int cur, n;
+    {
+        std::lock_guard<std::mutex> l(mu);
+        hud = cfg.hud;
+        on = cfg.enabled;
+        cur = cfg.cur;
+        n = cfg.n;
+        wcscpy_s(name, *cfg.p[cur].name ? cfg.p[cur].name : L"Untitled");
+    }
+    if (!hud) {
+        if (shown) ShowWindow(hudWnd, SW_HIDE);
+        shown = false;
+        return;
+    }
+    bool paused = pausedNow, pull = pulling;
+    UINT32 col = !on ? MUTED : paused ? ORANGE : pull ? GREEN : ACCENT;
+    swprintf_s(sub, L"%s  %d/%d", !on ? L"OFF" : paused ? L"PAUSED" : pull ? L"PULLING" : L"READY", cur + 1, n);
+    RECT m = GameMonitor();
+    if (shown && m.left == atX && m.top == atY && col == hudColor && !wcscmp(name, hudName) && !wcscmp(sub, hudSub)) return;
+    shown = true;
+    atX = m.left, atY = m.top;
+    hudColor = col;
+    wcscpy_s(hudName, name);
+    wcscpy_s(hudSub, sub);
+    float s = GetDpiForSystem() / 96.f;
+    DrawLayered(hudWnd, m.left + (int)(16 * s), m.top + (int)(16 * s), HUD_W, HUD_H, DrawHud);
+}
+
+// Timer 2 (~60 Hz): open/update/close the wheel, fade out the toast, keep the HUD current, blink the caret.
 static void OverlayTick() {
     ULONGLONG now = GetTickCount64();
     if (CaretVisible() != caretShown) {
@@ -1466,23 +1604,41 @@ static void OverlayTick() {
         UpdateLayeredWindow(toastWnd, nullptr, nullptr, nullptr, nullptr, nullptr, 0, &bf, ULW_ALPHA);
     }
 
+    UpdateHud();
+
     int key, n;
     { std::lock_guard<std::mutex> l(mu); key = cfg.wheelKey; n = cfg.n; }
+    static bool wheelLatch; // picked with a click: stays shut until the key is let go
     bool held = Down(key) && !capturing;
-    if (held && !wheelOpen) {
-        wheelOpen = true;
+    if (!held) wheelLatch = false;
+    if (held && !wheelOpen && !wheelLatch) {
+        wheelOpen = wheelShown = true;
+        wheelStep = 0;
+        wheelClick = false;
         RawMouse(true);
         wheelX = wheelY = wheelOpenT = 0;
+        wheelSel = -1;
         std::fill(std::begin(wheelHl), std::end(wheelHl), 0.f);
     }
     if (!wheelOpen) return;
+    if (int st = wheelStep.exchange(0)) { // scrolling steps the pick, as if the mouse had moved that way
+        int k = wheelSel;
+        if (k < 0) {
+            std::lock_guard<std::mutex> l(mu);
+            k = cfg.cur;
+        }
+        k = ((k + st) % n + n) % n;
+        wheelX = 60 * std::sin(k * TAU / n);
+        wheelY = -60 * std::cos(k * TAU / n);
+    }
     float len = std::hypot(wheelX, wheelY);
     wheelSel = -1;
     if (len > 25) { // slice 0 at the top, clockwise
         float a = std::atan2(wheelX, -wheelY) + TAU + TAU / 2 / n;
         wheelSel = (int)(a / (TAU / n)) % n;
     }
-    if (held) {
+    bool click = wheelClick.exchange(false);
+    if (held && !click) {
         wheelOpenT = std::min(1.f, wheelOpenT + .16f); // ~100 ms
         for (int i = 0; i < n; i++) wheelHl[i] += ((i == wheelSel) - wheelHl[i]) * .35f;
         RECT m = GameMonitor();
@@ -1492,7 +1648,8 @@ static void OverlayTick() {
                     DrawWheel, (BYTE)(255 * wheelOpenT));
         return;
     }
-    wheelOpen = false;
+    wheelLatch = click;
+    wheelOpen = wheelShown = false;
     RawMouse(false);
     ShowWindow(wheelWnd, SW_HIDE);
     if (wheelSel < 0) return;
@@ -1741,7 +1898,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     wc.lpfnWndProc = DefWindowProcW;
     wc.lpszClassName = L"MouseDownOverlay";
     RegisterClassW(&wc);
-    for (HWND* w : {&wheelWnd, &toastWnd}) // click-through, never takes focus from the game
+    for (HWND* w : {&wheelWnd, &toastWnd, &hudWnd}) // click-through, never takes focus from the game
         *w = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                              L"MouseDownOverlay", L"", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
     SetTimer(hwnd, 2, 16, nullptr);
