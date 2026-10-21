@@ -53,18 +53,28 @@ int main() {
     assert(ty == 200);
 
     // Horizontal sway: ±sway px/s on x, one full cycle per swayMs
-    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
+    auto approx = [](double a, double b) { return std::fabs(a - b) < 1e-6; };
     Profile w;
     w.vy = 0, w.vx = 0, w.sway = 50, w.swayMs = 400;
     Target(w, 1, 100, tx, ty);
-    assert(near(tx, 50) && ty == 0);        // quarter cycle: peak +
+    assert(approx(tx, 50) && ty == 0);      // quarter cycle: peak +
     Target(w, 1, 300, tx, ty);
-    assert(near(tx, -50));                   // three-quarter cycle: peak -
+    assert(approx(tx, -50));                // three-quarter cycle: peak -
     Target(w, 1, 200, tx, ty);
-    assert(near(tx, 0));                     // half cycle: zero crossing
-    w.off[9] = true;                         // the switch zeroes sway, keeping its value
+    assert(approx(tx, 0));                  // half cycle: zero crossing
+    w.off[9] = true;                        // the switch zeroes sway, keeping its value
     Profile we = Effective(w);
     Target(we, 1, 100, tx, ty);
     assert(tx == 0 && we.sway == 0 && w.sway == 50);
+
+    // Clipboard text round-trips a profile; the target keeps its own hotkey, junk is rejected
+    Profile a, b;
+    a.vy = 123, a.sway = 40, a.off[9] = true, a.mode = 2, a.holdKey = VK_LBUTTON, a.hotkey = 5;
+    wcscpy_s(a.name, L"A;b=c");
+    b.hotkey = 7;
+    assert(ImportProfile(ExportProfile(a).c_str(), b));
+    assert(b.vy == 123 && b.sway == 40 && b.off[9] && b.mode == 2 && b.holdKey == VK_LBUTTON);
+    assert(!wcscmp(b.name, L"A;b=c") && b.hotkey == 7);
+    assert(!ImportProfile(L"garbage", b) && b.vy == 123);
     puts("engine ok");
 }

@@ -27,7 +27,7 @@
 
 // ---------- settings ----------
 
-const int MAX_PROFILES = 100, NAME_LEN = 20, OFF_BITS = 10; // ponytail: fixed array keeps the per-tick config copy allocation-free
+const int MAX_PROFILES = 100, NAME_LEN = 20, OFF_BITS = 10, ACCENTS = 5; // ponytail: fixed array keeps the per-tick config copy allocation-free
 
 struct Profile {
     wchar_t name[NAME_LEN + 4] = L"Default";
@@ -43,6 +43,7 @@ struct Config {
     int n = 1, cur = 0, toggleKey = VK_F8, nextKey = 0, prevKey = 0;
     int pauseKey = 0; // held: pull and spam are suspended
     bool sound = false; // beep on on/off and profile switches
+    int accent = 0; // UI colour, index into accents[]
     int spamTrigger = 0, spamRequire = 0, spamKey = 0; // hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
     int wheelKey = 0; // hold to show the profile wheel
     float sens = 100, spamRate = 10, spamDelay = 0; // spamDelay: ms the spam keys must be held before clicking
@@ -53,7 +54,7 @@ struct Config {
     wchar_t port[16] = L""; // serial COM port of the HID board; empty = inject with SendInput
 };
 
-struct FieldDef { const wchar_t *key, *label, *fmt, *zero; float Profile::*f; float lo, hi, step; int bit = -1; };
+struct FieldDef { const wchar_t *key, *label, *fmt, *zero; float Profile::*f; float lo, hi, step; int bit = -1; float Config::*g = nullptr; };
 static const FieldDef fields[] = {
     {L"vy", L"Vertical pull", L"%.0f px/s", nullptr, &Profile::vy, -1000, 1000, 1},
     {L"vx", L"Horizontal pull", L"%.0f px/s", nullptr, &Profile::vx, -500, 500, 1},
@@ -82,20 +83,31 @@ static const FieldDef swayDefs[] = { // own pair, kept out of fields[] so its in
     {L"sway", L"Sway", L"±%.0f px/s", L"Off", &Profile::sway, 0, 400, 1, 9},
     {L"swayMs", L"Sway period", L"%.0f ms", nullptr, &Profile::swayMs, 100, 3000, 10},
 };
-static const FieldDef sensDef = {L"sens", L"Sensitivity", L"%.0f%%", nullptr, nullptr, 10, 300, 5};
-static const FieldDef spamDef = {L"spamRate", L"Rate", L"%.0f /s", nullptr, nullptr, 1, 50, 1};
-static const FieldDef spamDelayDef = {L"spamDelay", L"Delay", L"%.0f ms", L"Instant", nullptr, 0, 2000, 10};
-static const FieldDef spamJitterDef = {L"spamJitter", L"Rate jitter", L"±%.0f%%", L"Off", nullptr, 0, 50, 1};
+static const FieldDef sensDef = {L"sens", L"Sensitivity", L"%.0f%%", nullptr, nullptr, 10, 300, 5, -1, &Config::sens};
+static const FieldDef spamDef = {L"spamRate", L"Rate", L"%.0f /s", nullptr, nullptr, 1, 50, 1, -1, &Config::spamRate};
+static const FieldDef spamDelayDef = {L"spamDelay", L"Delay", L"%.0f ms", L"Instant", nullptr, 0, 2000, 10, -1, &Config::spamDelay};
+static const FieldDef spamJitterDef = {L"spamJitter", L"Rate jitter", L"±%.0f%%", L"Off", nullptr, 0, 50, 1, -1, &Config::spamJitter};
 const int STAGE_FIELDS = 8, PULL_FIELDS = 11; // fields[] layout: 8 stage fields, jitter, offset min/max, then Timing
 const double SPAM_HOLD_MS = 15; // how long each spam click stays pressed (shorter at high rates)
 const double TAP_MS = 150;    // tap-mode pull length when Pull duration is Unlimited
 const double SWAY_TAU = 6.283185307179586; // 2π, for the horizontal sway oscillation
 
+// Visit every profile slider field.
+template <class F> static void ForFields(F fn) {
+    for (auto& d : fields) fn(d);
+    for (auto& d : growDefs) fn(d);
+    for (auto& d : swayDefs) fn(d);
+}
+
 // Visit every profile field that has an on/off switch.
 template <class F> static void ForSwitches(F fn) {
-    for (auto& d : fields) if (d.bit >= 0) fn(d);
-    for (auto& d : growDefs) if (d.bit >= 0) fn(d);
-    for (auto& d : swayDefs) if (d.bit >= 0) fn(d);
+    ForFields([&](const FieldDef& d) { if (d.bit >= 0) fn(d); });
+}
+
+static float Default(const FieldDef& d) {
+    static const Profile dp{};
+    static const Config dc{};
+    return d.f ? dp.*d.f : d.g ? dc.*d.g : d.lo;
 }
 
 // The profile as the engine sees it: switched-off features read as 0.
@@ -138,6 +150,7 @@ static void LoadSettings() {
     cfg.spamJitter = (float)get(L"general", L"spamJitter", cfg.spamJitter, spamJitterDef.lo, spamJitterDef.hi);
     cfg.pauseKey = (int)get(L"general", L"pauseKey", cfg.pauseKey, 0, 254);
     cfg.sound = get(L"general", L"sound", 0, 0, 1) != 0;
+    cfg.accent = (int)get(L"general", L"accent", 0, 0, ACCENTS - 1);
     GetPrivateProfileStringW(L"general", L"port", L"", cfg.port, 16, ini);
     for (int i = 0; i < cfg.n; i++) {
         wchar_t sec[16], def[16];
@@ -192,6 +205,7 @@ static void Save() {
     put(L"general", L"spamJitter", c.spamJitter);
     put(L"general", L"pauseKey", c.pauseKey);
     put(L"general", L"sound", c.sound);
+    put(L"general", L"accent", c.accent);
     WritePrivateProfileStringW(L"general", L"port", c.port, ini);
     static int written = MAX_PROFILES; // sections that may exist on disk; first save sweeps them all
     int upto = std::max(c.n, written);
@@ -214,6 +228,54 @@ static void Save() {
         for (auto& d : swayDefs) put(sec, d.key, p.*d.f);
         ForSwitches([&](const FieldDef& d) { put(sec, (std::wstring(d.key) + L"Off").c_str(), p.off[d.bit]); });
     }
+}
+
+// One-line text form of a profile, for sharing through the clipboard. The name goes last so it may
+// contain any character; the profile hotkey stays out, since it belongs to this machine's setup.
+static std::wstring ExportProfile(const Profile& p) {
+    std::wstring s = L"MouseDown";
+    auto add = [&](const std::wstring& k, double v) {
+        wchar_t b[32];
+        swprintf_s(b, L"=%g", v);
+        s += L";" + k + b;
+    };
+    add(L"holdKey", p.holdKey);
+    add(L"requireKey", p.requireKey);
+    add(L"mode", p.mode);
+    ForFields([&](const FieldDef& d) { add(d.key, p.*d.f); });
+    ForSwitches([&](const FieldDef& d) { add(std::wstring(d.key) + L"Off", p.off[d.bit]); });
+    return s + L";name=" + p.name;
+}
+
+// Overwrites p from ExportProfile text (keeping p's hotkey); false if it isn't one.
+static bool ImportProfile(const wchar_t* s, Profile& p) {
+    const wchar_t tag[] = L"MouseDown;";
+    if (wcsncmp(s, tag, std::size(tag) - 1)) return false;
+    Profile q = p;
+    for (const wchar_t* t = s + std::size(tag) - 1; *t;) {
+        if (!wcsncmp(t, L"name=", 5)) {
+            wcsncpy_s(q.name, t + 5, NAME_LEN);
+            break;
+        }
+        const wchar_t* end = wcschr(t, L';');
+        if (!end) end = t + wcslen(t);
+        std::wstring kv(t, end);
+        size_t eq = kv.find(L'=');
+        if (eq != std::wstring::npos) {
+            std::wstring k = kv.substr(0, eq);
+            double v = _wtof(kv.c_str() + eq + 1);
+            if (k == L"holdKey") q.holdKey = std::clamp((int)v, 0, 254);
+            if (k == L"requireKey") q.requireKey = std::clamp((int)v, 0, 254);
+            if (k == L"mode") q.mode = std::clamp((int)v, 0, 2);
+            ForFields([&](const FieldDef& d) {
+                if (k == d.key) q.*d.f = (float)std::clamp(v, (double)d.lo, (double)d.hi);
+                if (d.bit >= 0 && k == std::wstring(d.key) + L"Off") q.off[d.bit] = v != 0;
+            });
+        }
+        t = *end ? end + 1 : end;
+    }
+    p = q;
+    return true;
 }
 
 // ---------- engine ----------
@@ -505,9 +567,13 @@ static void Engine(HWND hwnd) {
 
 enum : UINT32 {
     BG = 0x0E1014, CARD = 0x161920, BORDER = 0x252A35, TEXT = 0xE8EAF0, MUTED = 0x868D9C, DISABLED = 0x4A5060,
-    ACCENT = 0x7C6CFF, ACCENT_SOFT = 0xD8D4FF, GREEN = 0x3DDC97, TEAL = 0x38BDF8, TRACK = 0x2A2F3B,
+    GREEN = 0x3DDC97, TEAL = 0x38BDF8, TRACK = 0x2A2F3B,
     BTN = 0x1D212A, BTN_HOVER = 0x272C38, RED = 0xE5484D, RED_SOFT = 0x3A1F24, WHITE = 0xFFFFFF,
 };
+static const UINT32 accents[ACCENTS][2] = { // accent, soft tint for text on it
+    {0x7C6CFF, 0xD8D4FF}, {0x3B82F6, 0xBFDBFE}, {0xDB2777, 0xFBCFE8}, {0xEA580C, 0xFED7AA}, {0x059669, 0xA7F3D0},
+};
+static UINT32 ACCENT = accents[0][0], ACCENT_SOFT = accents[0][1]; // set from cfg.accent each frame
 const float WIN_W = 1260, WIN_H = 830, HEADER = 56;
 const D2D1_RECT_F PILL = {132, 17, 216, 39};
 
@@ -521,7 +587,7 @@ static ID2D1SolidColorBrush *br, *hbr, *obr;
 static HWND wheelWnd, toastWnd;
 static IDWriteTextFormat *fTitle, *fSection, *fLabel, *fValue, *fSmall, *fPill;
 
-static struct { float mx = -1, my = -1, wheel = 0; bool down = false, pressed = false; } in;
+static struct { float mx = -1, my = -1, wheel = 0; bool down = false, pressed = false, rpressed = false; } in;
 static void* active;        // slider being dragged
 static int* bindTarget;     // key slot waiting for a key press
 static wchar_t* editTarget; // text field being typed into (profile name or COM port)
@@ -605,6 +671,11 @@ static void Slider(const FieldDef& d, float& v, float x, float y, float w, bool*
     }
     if (hover && in.wheel) {
         v += d.step * in.wheel;
+        saveReq = true;
+    }
+    if (in.rpressed && In(R(x - 8, y, w + 16, 44))) { // right-click: back to the default
+        v = Default(d);
+        if (off) *off = false;
         saveReq = true;
     }
 
@@ -774,6 +845,34 @@ static void Preview(const Profile& p, double scale, float x, float y, float w, f
     Text(buf, R(x, y + h + 28, w, 20), fSmall, MUTED);
 }
 
+static void CopyText(const std::wstring& s) {
+    if (!OpenClipboard(hwnd)) return;
+    EmptyClipboard();
+    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        CopyMemory(GlobalLock(g), s.c_str(), bytes);
+        GlobalUnlock(g);
+        if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+    }
+    CloseClipboard();
+}
+
+static std::wstring PasteText() {
+    std::wstring s;
+    if (!OpenClipboard(hwnd)) return s;
+    if (HANDLE g = GetClipboardData(CF_UNICODETEXT))
+        if (auto* t = (const wchar_t*)GlobalLock(g)) {
+            s = t;
+            GlobalUnlock(g);
+        }
+    CloseClipboard();
+    while (!s.empty() && (s.back() == L'\r' || s.back() == L'\n')) s.pop_back();
+    return s;
+}
+
+static wchar_t toastReq[64]; // toast to show once the frame is done (the overlay can't draw mid-frame)
+static UINT32 toastReqColor;
+
 static void RunProfileCmd() {
     Profile* p = cfg.p;
     int& n = cfg.n;
@@ -793,15 +892,28 @@ static void RunProfileCmd() {
         std::copy(p + cur + 1, p + n, p + cur);
         n--;
         cur = std::min(cur, n - 1);
+    } else if (profileCmd == 4) { // copy
+        CopyText(ExportProfile(p[cur]));
+        wcscpy_s(toastReq, L"Profile copied");
+        toastReqColor = ACCENT;
+    } else if (profileCmd == 5) { // paste over the current one
+        bool ok = ImportProfile(PasteText().c_str(), p[cur]);
+        wcscpy_s(toastReq, ok ? L"Profile pasted" : L"No profile on the clipboard");
+        toastReqColor = ok ? GREEN : RED;
     }
-    if (profileCmd) saveReq = true;
+    if (profileCmd) {
+        saveReq = true;
+        InvalidateRect(hwnd, nullptr, FALSE); // this frame was drawn before the change
+    }
     profileCmd = 0;
 }
 
 static void Frame(float W) {
     cursor = IDC_ARROW;
     numSeen = false;
-    if (bindTarget) in.pressed = false; // binding is modal: the click belongs to the key catcher
+    if (bindTarget) in.pressed = in.rpressed = false; // binding is modal: the click belongs to the key catcher
+    ACCENT = accents[cfg.accent][0];
+    ACCENT_SOFT = accents[cfg.accent][1];
     rt->Clear(D2D1::ColorF(BG));
     Profile& p = cfg.p[cfg.cur];
 
@@ -880,7 +992,9 @@ static void Frame(float W) {
     NameField(p.name, NAME_LEN, R(220, 64, 250, 34), L"Untitled", L"Rename");
     if (TextButton(L"Duplicate", R(480, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
     if (TextButton(L"Delete", R(588, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
-    Text(L"Scroll a slider for fine steps · click a value to type it", R(680, 64, W - 700, 34), fSmall, MUTED,
+    if (TextButton(L"Copy", R(680, 64, 72, 34))) profileCmd = 4;
+    if (TextButton(L"Paste", R(760, 64, 72, 34))) profileCmd = 5;
+    Text(L"Scroll: fine steps · click value: type · right-click: reset", R(840, 64, W - 860, 34), fSmall, MUTED,
          DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     // middle column
@@ -901,6 +1015,19 @@ static void Frame(float W) {
     NameField(cfg.port, 15, R(368, 620, 136, 34), L"SendInput", L"blank = inject");
     KeyBind(L"Hold to pause", cfg.pauseKey, 236, 664, 268);
     Toggle(L"Sounds", cfg.sound, 236, 708, 268);
+    Text(L"Accent", R(236, 752, 120, 32), fLabel, TEXT);
+    for (int k = 0; k < ACCENTS; k++) {
+        float cx = 493 - (ACCENTS - 1 - k) * 28.f, cy = 768;
+        if (Button(R(cx - 12, cy - 12, 24, 24))) {
+            cfg.accent = k;
+            saveReq = true;
+        }
+        Circle(cx, cy, 9, accents[k][0]);
+        if (cfg.accent == k) {
+            Color(TEXT);
+            rt->DrawEllipse({{cx, cy}, 12.5f, 12.5f}, br, 1.5f);
+        }
+    }
 
     // right column
     // Pull: stage tabs pick which stage's sliders show; stage 1 runs from activation
@@ -977,7 +1104,7 @@ static void Paint() {
         Frame(rt->GetSize().width);
         onTop = cfg.onTop;
     }
-    in.pressed = false;
+    in.pressed = in.rpressed = false;
     in.wheel = 0;
     if (rt->EndDraw() == D2DERR_RECREATE_TARGET) {
         hbr->Release();
@@ -1237,6 +1364,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         saveReq = true;
         InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_RBUTTONDOWN:
+        in.rpressed = true;
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
     case WM_MOUSEWHEEL:
         in.wheel += GET_WHEEL_DELTA_WPARAM(wp) / (float)WHEEL_DELTA;
         InvalidateRect(h, nullptr, FALSE);
@@ -1340,6 +1471,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (saveReq) {
             saveReq = false;
             Save();
+        }
+        if (*toastReq) {
+            Notify(toastReq, toastReqColor);
+            *toastReq = 0;
         }
         if (headerCmd == 1) ShowWindow(h, SW_MINIMIZE);
         if (headerCmd == 2) DestroyWindow(h);
