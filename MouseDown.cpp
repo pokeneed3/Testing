@@ -41,9 +41,12 @@ struct Profile {
 struct Config {
     Profile p[MAX_PROFILES];
     int n = 1, cur = 0, toggleKey = VK_F8, nextKey = 0, prevKey = 0;
+    int pauseKey = 0; // held: pull and spam are suspended
+    bool sound = false; // beep on on/off and profile switches
     int spamTrigger = 0, spamRequire = 0, spamKey = 0; // hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
     int wheelKey = 0; // hold to show the profile wheel
     float sens = 100, spamRate = 10, spamDelay = 0; // spamDelay: ms the spam keys must be held before clicking
+    float spamJitter = 0; // ±% random change of each click interval
     bool spamDelayOff = false;
     bool enabled = true, onTop = false, spamOn = false, notify = true;
     bool spamPull = false; // pull runs the whole time auto spam is clicking, in any activation mode
@@ -82,6 +85,7 @@ static const FieldDef swayDefs[] = { // own pair, kept out of fields[] so its in
 static const FieldDef sensDef = {L"sens", L"Sensitivity", L"%.0f%%", nullptr, nullptr, 10, 300, 5};
 static const FieldDef spamDef = {L"spamRate", L"Rate", L"%.0f /s", nullptr, nullptr, 1, 50, 1};
 static const FieldDef spamDelayDef = {L"spamDelay", L"Delay", L"%.0f ms", L"Instant", nullptr, 0, 2000, 10};
+static const FieldDef spamJitterDef = {L"spamJitter", L"Rate jitter", L"±%.0f%%", L"Off", nullptr, 0, 50, 1};
 const int STAGE_FIELDS = 8, PULL_FIELDS = 11; // fields[] layout: 8 stage fields, jitter, offset min/max, then Timing
 const double SPAM_HOLD_MS = 15; // how long each spam click stays pressed (shorter at high rates)
 const double TAP_MS = 150;    // tap-mode pull length when Pull duration is Unlimited
@@ -131,6 +135,9 @@ static void LoadSettings() {
     cfg.spamRate = (float)get(L"general", L"spamRate", cfg.spamRate, spamDef.lo, spamDef.hi);
     cfg.spamDelay = (float)get(L"general", L"spamDelay", cfg.spamDelay, spamDelayDef.lo, spamDelayDef.hi);
     cfg.spamDelayOff = get(L"general", L"spamDelayOff", 0, 0, 1) != 0;
+    cfg.spamJitter = (float)get(L"general", L"spamJitter", cfg.spamJitter, spamJitterDef.lo, spamJitterDef.hi);
+    cfg.pauseKey = (int)get(L"general", L"pauseKey", cfg.pauseKey, 0, 254);
+    cfg.sound = get(L"general", L"sound", 0, 0, 1) != 0;
     GetPrivateProfileStringW(L"general", L"port", L"", cfg.port, 16, ini);
     for (int i = 0; i < cfg.n; i++) {
         wchar_t sec[16], def[16];
@@ -182,6 +189,9 @@ static void Save() {
     put(L"general", L"spamRate", c.spamRate);
     put(L"general", L"spamDelay", c.spamDelay);
     put(L"general", L"spamDelayOff", c.spamDelayOff);
+    put(L"general", L"spamJitter", c.spamJitter);
+    put(L"general", L"pauseKey", c.pauseKey);
+    put(L"general", L"sound", c.sound);
     WritePrivateProfileStringW(L"general", L"port", c.port, ini);
     static int written = MAX_PROFILES; // sections that may exist on disk; first save sweeps them all
     int upto = std::max(c.n, written);
@@ -393,7 +403,8 @@ static void Engine(HWND hwnd) {
         double nowMs = ms(now.QuadPart);
 
         // spam first, so a linked pull starts on the same tick as the first click
-        bool spamKeys = c.enabled && c.spamOn && !cap && c.spamKey && Down(c.spamTrigger) &&
+        bool paused = Down(c.pauseKey) && !cap;
+        bool spamKeys = c.enabled && c.spamOn && !cap && !paused && c.spamKey && Down(c.spamTrigger) &&
                         (!c.spamRequire || Down(c.spamRequire));
         if (!spamKeys) spamSince = -1;
         else if (spamSince < 0) spamSince = nowMs;
@@ -401,7 +412,7 @@ static void Engine(HWND hwnd) {
         bool spamPulls = spam && c.spamPull;
 
         bool req = !p.requireKey || Down(p.requireKey), restart;
-        bool active = Step(trig, p.mode, Down(p.holdKey) && req, req, spamPulls, c.enabled && !cap, wasActive, restart);
+        bool active = Step(trig, p.mode, Down(p.holdKey) && req, req, spamPulls, c.enabled && !cap && !paused, wasActive, restart);
         if (restart) wasActive = false;
         if (active != pulling) {
             pulling = active;
@@ -472,7 +483,7 @@ static void Engine(HWND hwnd) {
             spamVk = 0;
         }
         if (spam && !spamVk && nowMs >= spamAt) {
-            double period = 1000 / c.spamRate;
+            double period = 1000 / c.spamRate * (1 + c.spamJitter / 100 * uni(rng));
             spamVk = c.spamKey;
             SendKey(spamVk, true);
             spamUpAt = nowMs + std::min(SPAM_HOLD_MS, period / 2);
@@ -888,6 +899,8 @@ static void Frame(float W) {
     Toggle(L"Always on top", cfg.onTop, 236, 576, 268);
     Text(L"HID port", R(236, 620, 128, 34), fLabel, TEXT);
     NameField(cfg.port, 15, R(368, 620, 136, 34), L"SendInput", L"blank = inject");
+    KeyBind(L"Hold to pause", cfg.pauseKey, 236, 664, 268);
+    Toggle(L"Sounds", cfg.sound, 236, 708, 268);
 
     // right column
     // Pull: stage tabs pick which stage's sliders show; stage 1 runs from activation
@@ -918,7 +931,7 @@ static void Frame(float W) {
         PS(fields[i], 556, 552 + (i - PULL_FIELDS) * 50.f, 348);
 
     // far right column
-    Card(940, 116, 300, 312, L"AUTO SPAM");
+    Card(940, 116, 300, 362, L"AUTO SPAM");
     Toggle(L"Enabled", cfg.spamOn, 956, 152, 268);
     KeyBind(L"Hold to spam", cfg.spamTrigger, 956, 196, 268);
     KeyBind(L"Also require", cfg.spamRequire, 956, 240, 268);
@@ -926,15 +939,16 @@ static void Frame(float W) {
     Slider(spamDef, cfg.spamRate, 956, 330, 126);
     Slider(spamDelayDef, cfg.spamDelay, 1098, 330, 126, &cfg.spamDelayOff);
     Toggle(L"Clicks trigger pull", cfg.spamPull, 956, 380, 268);
+    Slider(spamJitterDef, cfg.spamJitter, 956, 426, 268);
 
-    Card(940, 440, 300, 130, L"OVERLAY");
-    KeyBind(L"Hold for wheel", cfg.wheelKey, 956, 476, 268);
-    Toggle(L"Notifications", cfg.notify, 956, 520, 268);
+    Card(940, 490, 300, 130, L"OVERLAY");
+    KeyBind(L"Hold for wheel", cfg.wheelKey, 956, 526, 268);
+    Toggle(L"Notifications", cfg.notify, 956, 570, 268);
 
-    Card(940, 582, 300, 230, L"PULL GROWTH", L"px/s per step");
-    PS(growDefs[0], 956, 618, 268);
-    Slider(growDefs[1], p.*growDefs[1].f, 956, 676, 126);
-    Slider(growDefs[2], p.*growDefs[2].f, 1098, 676, 126);
+    Card(940, 632, 300, 180, L"PULL GROWTH", L"px/s per step");
+    PS(growDefs[0], 956, 668, 268);
+    Slider(growDefs[1], p.*growDefs[1].f, 956, 726, 126);
+    Slider(growDefs[2], p.*growDefs[2].f, 1098, 726, 126);
 
     if (numTarget && !numSeen) { // its slider is gone (profile or stage switched): drop the edit
         numTarget = nullptr;
@@ -1047,6 +1061,11 @@ static void Notify(const wchar_t* msg, UINT32 color) {
     RECT m = GameMonitor();
     float s = GetDpiForSystem() / 96.f;
     DrawLayered(toastWnd, (m.left + m.right) / 2 - (int)(TOAST_W * s / 2), m.top + (int)(40 * s), TOAST_W, TOAST_H, DrawToast);
+}
+
+static void Chime(int ev) { // Beep blocks for its length, so it gets its own thread
+    DWORD freq = ev == EV_ON ? 880 : ev == EV_OFF ? 440 : 660;
+    std::thread([freq] { Beep(freq, 70); }).detach();
 }
 
 static float wheelHl[MAX_PROFILES]; // per-slice highlight, eased toward 1 for the hovered one
@@ -1169,16 +1188,18 @@ static void OverlayTick() {
     ShowWindow(wheelWnd, SW_HIDE);
     if (wheelSel < 0) return;
     wchar_t msg[64];
-    bool notify;
+    bool notify, sound;
     {
         std::lock_guard<std::mutex> l(mu);
         cfg.cur = wheelSel;
         swprintf_s(msg, L"Profile: %s", cfg.p[cfg.cur].name);
         notify = cfg.notify;
+        sound = cfg.sound;
     }
     Save();
     InvalidateRect(hwnd, nullptr, FALSE);
     if (notify) Notify(msg, ACCENT);
+    if (sound) Chime(EV_PROFILE);
 }
 
 static float Scale() { return 96.f / GetDpiForWindow(hwnd); } // pixels -> DIPs
@@ -1277,17 +1298,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_APP + 1: { // engine hotkey: on/off or profile switch
-        bool notify;
+        bool notify, sound;
         wchar_t msg[64];
         {
             std::lock_guard<std::mutex> l(mu);
             notify = cfg.notify;
+            sound = cfg.sound;
             if (wp == EV_PROFILE) swprintf_s(msg, L"Profile: %s", cfg.p[cfg.cur].name);
             else wcscpy_s(msg, wp == EV_ON ? L"Enabled" : L"Disabled");
         }
         Save();
         InvalidateRect(h, nullptr, FALSE);
         if (notify) Notify(msg, wp == EV_ON ? GREEN : wp == EV_OFF ? RED : ACCENT);
+        if (sound) Chime((int)wp);
         return 0;
     }
     case WM_INPUT: { // raw mouse motion steers the wheel, even while a game has the cursor locked
