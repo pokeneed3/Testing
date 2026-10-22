@@ -94,6 +94,16 @@ int main() {
     gc.p[2].group = true;
     assert(SlotProfile(gc, gc.p[0], 0) == -1);
 
+    // Switching targets: everything, or only the groups when set to groups (unless there are none)
+    int tg[MAX_PROFILES];
+    assert(SwitchTargets(gc, tg) == 3 && StepTarget(gc, 2, 1) == 0 && StepTarget(gc, 0, -1) == 2);
+    gc.switchGroups = true; // groups are 0 and 2
+    assert(SwitchTargets(gc, tg) == 2 && tg[0] == 0 && tg[1] == 2);
+    assert(StepTarget(gc, 0, 1) == 2 && StepTarget(gc, 2, 1) == 0 && StepTarget(gc, 0, -1) == 2);
+    assert(StepTarget(gc, 1, 1) == 0 && StepTarget(gc, 1, -1) == 2); // from a normal profile: first / last group
+    gc.p[0].group = gc.p[2].group = false;
+    assert(SwitchTargets(gc, tg) == 3);
+
     // Settings survive a save and load, non-ASCII names and deleted profiles included
     GetTempPathW(MAX_PATH, ini);
     wcscat_s(ini, L"engine_check.ini");
