@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <winhttp.h>
+#include <shellapi.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -25,6 +26,8 @@
 #pragma comment(lib, "dwmapi")
 #pragma comment(lib, "winmm")
 #pragma comment(lib, "winhttp")
+#pragma comment(lib, "shell32")
+#pragma comment(lib, "advapi32")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
 // ---------- settings ----------
@@ -55,6 +58,7 @@ struct Config {
     int lastKey = 0;  // jump back to the profile used before this one
     int quickKey = 0; // held: 1-9 picks that profile, the mouse wheel steps through them
     bool hud = false; // small always-on-top readout of the active profile
+    bool runAsAdmin = false; // restart elevated on launch, so games running as admin can be seen and driven
     int swapKey = 0;          // flips the active group between its two slots
     bool scrollSwap = false;  // each mouse wheel notch flips the active group's slot (the game still gets the scroll)
     bool slotReset = false;   // switching to a group starts it in slot 1, not where it was left
@@ -222,6 +226,7 @@ static void LoadSettings() {
     cfg.lastKey = (int)get(L"general", L"lastKey", cfg.lastKey, 0, 254);
     cfg.quickKey = (int)get(L"general", L"quickKey", cfg.quickKey, 0, 254);
     cfg.hud = get(L"general", L"hud", 0, 0, 1) != 0;
+    cfg.runAsAdmin = get(L"general", L"runAsAdmin", 0, 0, 1) != 0;
     cfg.swapKey = (int)get(L"general", L"swapKey", cfg.swapKey, 0, 254);
     cfg.scrollSwap = get(L"general", L"scrollSwap", 0, 0, 1) != 0;
     cfg.slotReset = get(L"general", L"slotReset", 0, 0, 1) != 0;
@@ -292,6 +297,7 @@ static void Save() {
     put(L"lastKey", c.lastKey);
     put(L"quickKey", c.quickKey);
     put(L"hud", c.hud);
+    put(L"runAsAdmin", c.runAsAdmin);
     put(L"swapKey", c.swapKey);
     put(L"scrollSwap", c.scrollSwap);
     put(L"slotReset", c.slotReset);
@@ -915,6 +921,43 @@ static void StartUpdate(HWND w) {
     }).detach();
 }
 
+// ---------- administrator ----------
+
+// Windows keeps a normal program away from one running as administrator: its input hooks get nothing and
+// its clicks and mouse movement don't arrive while that program has focus. Games often run as admin, so
+// Mouse Down then has to as well.
+static bool selfAdmin;
+static std::atomic<bool> adminNeeded; // the focused program runs as admin and we don't
+
+static bool Elevated(HANDLE proc, bool& known) {
+    HANDLE tok;
+    TOKEN_ELEVATION e{};
+    DWORD sz;
+    known = OpenProcessToken(proc, TOKEN_QUERY, &tok) != FALSE;
+    if (!known) return false;
+    known = GetTokenInformation(tok, TokenElevation, &e, sizeof e, &sz) != FALSE;
+    CloseHandle(tok);
+    return known && e.TokenIsElevated;
+}
+
+// Does the focused window's program run above us? pid gets its process id.
+static bool ForegroundOutranksUs(DWORD& pid) {
+    pid = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    if (selfAdmin || !pid || pid == GetCurrentProcessId()) return false;
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc) return false; // can't tell
+    bool known, up = Elevated(proc, known);
+    CloseHandle(proc);
+    return known ? up : true; // refused a look at its token: it runs above us
+}
+
+// Start another copy of us as administrator (Windows asks first). False if that was declined or failed.
+static bool RelaunchAsAdmin() {
+    std::wstring self = SelfPath();
+    return (INT_PTR)ShellExecuteW(nullptr, L"runas", self.c_str(), nullptr, nullptr, SW_SHOWNORMAL) > 32;
+}
+
 // ---------- UI ----------
 
 enum : UINT32 {
@@ -927,7 +970,8 @@ static const UINT32 accents[ACCENTS][2] = { // accent, soft tint for text on it
 };
 static UINT32 ACCENT = accents[0][0], ACCENT_SOFT = accents[0][1]; // set from cfg.accent each frame
 const float WIN_W = 1260, WIN_H = 830, HEADER = 56;
-const D2D1_RECT_F PILL = {132, 17, 216, 39}, UPDATE_BTN = {WIN_W - 236, 13, WIN_W - 108, 43}, TABS = {236, 13, 530, 43};
+const D2D1_RECT_F PILL = {132, 17, 216, 39}, UPDATE_BTN = {WIN_W - 236, 13, WIN_W - 108, 43},
+                  ADMIN_BTN = {WIN_W - 404, 13, WIN_W - 244, 43}, TABS = {236, 13, 530, 43};
 
 static HWND hwnd;
 static ID2D1Factory* d2d;
@@ -1506,6 +1550,12 @@ static void Frame(float W) {
     Circle(PILL.left + 13, PILL.top + 11, 3.5f, sc);
     Text(!cfg.enabled ? L"OFF" : paused ? L"PAUSED" : pull ? L"PULLING" : L"READY", R(PILL.left + 23, PILL.top, 60, 22), fPill, sc);
 
+    if (adminNeeded) { // the focused game runs as admin, so we can't see or drive it until we do too
+        if (Button(ADMIN_BTN)) headerCmd = 3;
+        Fill(ADMIN_BTN, 8, RED, In(ADMIN_BTN) ? .9f : .75f);
+        Text(L"Restart as admin", ADMIN_BTN, fValue, WHITE, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
     int upd = updState;
     static const wchar_t* const updLabels[] = {L"Update", L"Checking…", L"Up to date", L"Install update", L"Updating…", L"Update failed"};
     bool updBusy = upd == UPD_CHECKING || upd == UPD_INSTALLING;
@@ -1702,7 +1752,7 @@ static void Frame(float W) {
             Card(840, 116, 400, 296, L"TIMING & SMOOTHING");
         }
     } else {
-        Card(20, 64, 380, 460, L"GENERAL");
+        Card(20, 64, 380, 600, L"GENERAL");
         KeyBind(L"On / off", cfg.toggleKey, 36, 100, 348);
         KeyBind(L"Hold to pause", cfg.pauseKey, 36, 144, 348);
         Slider(sensDef, cfg.sens, 36, 190, 348);
@@ -1725,6 +1775,16 @@ static void Frame(float W) {
                 rt->DrawEllipse({{cx, cy}, 12.5f, 12.5f}, br, 1.5f);
             }
         }
+
+        Line(36, 512, 384, 512, BORDER);
+        Toggle(L"Always run as administrator", cfg.runAsAdmin, 36, 524, 348);
+        if (selfAdmin) {
+            Text(L"Running as administrator", R(36, 568, 348, 34), fLabel, GREEN);
+        } else if (TextButton(L"Restart as administrator now", R(36, 568, 348, 34))) {
+            headerCmd = 3;
+        }
+        Text(L"Needed when a game runs as admin: Windows keeps", R(36, 612, 348, 18), fSmall, MUTED);
+        Text(L"other programs from seeing its input or clicking in it", R(36, 630, 348, 18), fSmall, MUTED);
 
         Card(420, 64, 380, 460, L"SWITCHING", L"Backspace clears");
         KeyBind(L"Next profile", cfg.nextKey, 436, 100, 348);
@@ -1820,7 +1880,7 @@ static ULONGLONG toastAt; // 0 = no toast showing
 static bool wheelOpen;
 static int wheelSel = -1;
 static float wheelX, wheelY; // raw mouse motion since the wheel opened
-const float WHEEL_SIZE = 400, TOAST_W = 280, TOAST_H = 48;
+const float WHEEL_SIZE = 400, TOAST_W = 420, TOAST_H = 48;
 
 static RECT GameMonitor() { // the monitor the foreground window (usually the game) is on
     MONITORINFO mi{sizeof mi};
@@ -2046,6 +2106,22 @@ static void OverlayTick() {
 
     UpdateHud();
 
+    static ULONGLONG nextAdminCheck;
+    static DWORD warnedPid;
+    if (now >= nextAdminCheck) {
+        nextAdminCheck = now + 500;
+        DWORD pid;
+        bool need = ForegroundOutranksUs(pid);
+        if (need != adminNeeded) {
+            adminNeeded = need;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (need && pid != warnedPid) {
+            warnedPid = pid;
+            Notify(L"This game runs as admin: restart Mouse Down as admin", RED);
+        }
+    }
+
     int key, n;
     {
         std::lock_guard<std::mutex> l(mu);
@@ -2125,7 +2201,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         bool overPill = x >= PILL.left && x < PILL.right && y >= PILL.top && y < PILL.bottom;
         bool overUpdate = x >= UPDATE_BTN.left && x < UPDATE_BTN.right && y >= UPDATE_BTN.top && y < UPDATE_BTN.bottom;
         bool overTabs = x >= TABS.left && x < TABS.right && y >= TABS.top && y < TABS.bottom;
-        return y < HEADER && x < WIN_W - 100 && !overPill && !overUpdate && !overTabs ? HTCAPTION : HTCLIENT;
+        bool overAdmin = adminNeeded && x >= ADMIN_BTN.left && x < ADMIN_BTN.right && y >= ADMIN_BTN.top && y < ADMIN_BTN.bottom;
+        return y < HEADER && x < WIN_W - 100 && !overPill && !overUpdate && !overTabs && !overAdmin ? HTCAPTION : HTCLIENT;
     }
     case WM_MOUSEMOVE: {
         float s = Scale();
@@ -2298,6 +2375,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         if (headerCmd == 1) ShowWindow(h, SW_MINIMIZE);
         if (headerCmd == 2) DestroyWindow(h);
+        if (headerCmd == 3) { // restart as admin: save, start the elevated copy, and leave it to it
+            KillTimer(h, 3);
+            Save();
+            if (RelaunchAsAdmin()) DestroyWindow(h);
+        }
         headerCmd = 0;
         return 0;
     }
@@ -2335,6 +2417,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     wcsrchr(ini, L'\\')[1] = 0;
     wcscat_s(ini, L"settings.ini");
     LoadSettings();
+    bool known;
+    selfAdmin = Elevated(GetCurrentProcess(), known);
+    if (cfg.runAsAdmin && !selfAdmin && RelaunchAsAdmin()) return 0; // declined: carry on without
 
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &d2d);
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)&dw);
