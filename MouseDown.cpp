@@ -640,6 +640,20 @@ static bool Extended(int vk) { // keys whose scan code needs the E0 prefix
            vk == VK_RMENU || vk == VK_DIVIDE;
 }
 
+// SendInput, timed for the diagnostic log: a slow or refused send means our input is stuck behind something.
+static UINT TimedSend(INPUT* in, const char* what) {
+    if (!diagOn) return SendInput(1, in, sizeof *in);
+    LARGE_INTEGER f, a, b;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    UINT sent = SendInput(1, in, sizeof *in);
+    QueryPerformanceCounter(&b);
+    double took = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+    if (!sent) Diag("SendInput refused the %s (error %lu)", what, GetLastError());
+    else if (took > 20) Diag("SendInput took %.0f ms for the %s", took, what);
+    return sent;
+}
+
 // Press or release vk (mouse button or key) via SendInput.
 static void SendKey(int vk, bool down) {
     sentTick[vk & 255] = GetTickCount64();
@@ -661,7 +675,7 @@ static void SendKey(int vk, bool down) {
         ev.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
         ev.ki.dwFlags = KEYEVENTF_SCANCODE | (Extended(vk) ? KEYEVENTF_EXTENDEDKEY : 0) | (down ? 0 : KEYEVENTF_KEYUP);
     }
-    SendInput(1, &ev, sizeof ev);
+    TimedSend(&ev, "spam click");
 }
 
 // Open the HID board's serial port. \\.\ prefix is needed for COM10+.
@@ -752,6 +766,7 @@ static void Engine(HWND hwnd) {
     double vx = 0, vy = 0, ax = 0, ay = 0, jx = 1, jy = 1, nextJitter = 0, ox = 0, oy = 0, spamAt = 0, spamUpAt = 0;
     int spamVk = 0;         // key currently pressed by spam (0 = none)
     int spamLast = 0;       // the key spam was clicking last tick, to hand back to the game when it stops
+    bool movedYet = false;  // diagnostic log: whether this pull has sent its first move yet
     bool spamWas = false;
     double spamSince = -1; // when the spam keys went down (-1 = not held)
     Config c;
@@ -856,6 +871,7 @@ static void Engine(HWND hwnd) {
         if (restart) wasActive = false;
         if (active != pulling) {
             Diag(active ? "PULL ON" : "pull off");
+            movedYet = false;
             pulling = active;
             PostMessageW(hwnd, WM_APP, 0, 0);
         }
@@ -930,7 +946,9 @@ static void Engine(HWND hwnd) {
                     in.mi.dx = ix;
                     in.mi.dy = iy;
                     in.mi.dwFlags = MOUSEEVENTF_MOVE; // relative, works with games that lock the cursor
-                    SendInput(1, &in, sizeof in);
+                    if (diagOn && !movedYet) Diag("first pull move sent (%d, %d)", ix, iy);
+                    movedYet = true;
+                    TimedSend(&in, "pull move");
                 }
             }
         }
