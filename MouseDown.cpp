@@ -430,6 +430,7 @@ static std::atomic<int> quickKeyNow;          // engine keeps this at cfg.quickK
 static std::atomic<int> quickJump{-1};        // profile index picked with quick key + 1-9
 static std::atomic<int> quickStep, wheelStep; // mouse wheel steps: quick key held / profile wheel open
 static std::atomic<bool> wheelShown, wheelClick; // profile wheel is open / it got a left click
+static std::atomic<int> wheelDX, wheelDY;        // mouse motion while the profile wheel is open (it steers it)
 static std::atomic<int> gameScroll;              // whole wheel notches that went on to the game (slot swapping)
 static bool Down(int vk);
 
@@ -437,6 +438,13 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
     static bool eatLUp; // the left press went to the wheel, so its release must too
     auto* m = (MSLLHOOKSTRUCT*)lp;
     if (code == HC_ACTION && !(m->flags & LLMHF_INJECTED)) {
+        if (wp == WM_MOUSEMOVE && wheelShown) { // the wheel holds the mouse still: it steers the wheel, not the game
+            POINT at;
+            GetCursorPos(&at); // a blocked move leaves the cursor here; pt is where it would have gone
+            wheelDX += m->pt.x - at.x;
+            wheelDY += m->pt.y - at.y;
+            return 1;
+        }
         if (wp == WM_LBUTTONDOWN && wheelShown) { // picks on the wheel, never fires in the game
             wheelClick = eatLUp = true;
             return 1;
@@ -496,7 +504,6 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
 // focus. Our own SendInput clicks come with no device, so they never count as the player holding a button.
 static std::atomic<bool> rawDown[256];
 static std::atomic<bool> rawMouse, rawKeys;  // raw input has delivered real device input of that kind
-static std::atomic<int> wheelDX, wheelDY;    // mouse motion while the profile wheel is open
 // Windows sends our own SendInput events to raw input without a device. Should some setup echo them with one,
 // raw input can't tell our clicks from the player's for that key, and the hooks decide it instead.
 static std::atomic<ULONGLONG> sentTick[256];
@@ -526,7 +533,7 @@ static LRESULT CALLBACK RawProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         button(RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, VK_MBUTTON);
         button(RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, VK_XBUTTON1);
         button(RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, VK_XBUTTON2);
-        if (wheelShown && !(m.usFlags & MOUSE_MOVE_ABSOLUTE)) { // steers the profile wheel, even with the cursor locked
+        if (wheelShown && !hooked && !(m.usFlags & MOUSE_MOVE_ABSOLUTE)) { // without the hooks, the wheel steers from here
             wheelDX += m.lLastX;
             wheelDY += m.lLastY;
         }
