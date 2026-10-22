@@ -492,26 +492,93 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
-// Own thread so a busy UI thread can never stall system-wide input.
-static void HookThread() {
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL); // answer fast, or Windows skips the hook
-    hooked =SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0) &&
-             SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) {}
+// Raw input: key and button state straight from the devices, the way games read them. Unlike the hooks it
+// can't be skipped when Windows is busy, and unlike GetAsyncKeyState it doesn't lag behind while a game has
+// focus. Our own SendInput clicks come with no device, so they never count as the player holding a button.
+static std::atomic<bool> rawDown[256];
+static std::atomic<bool> rawMouse, rawKeys;  // raw input has delivered real device input of that kind
+static std::atomic<int> wheelDX, wheelDY;    // mouse motion while the profile wheel is open
+// Windows sends our own SendInput events to raw input without a device. Should some setup echo them with one,
+// raw input can't tell our clicks from the player's for that key, and the hooks decide it instead.
+static std::atomic<ULONGLONG> sentTick[256];
+static std::atomic<int> sentDir[256]; // last thing SendKey did to each key: 1 pressed, 2 released
+static std::atomic<bool> rawEcho[256];
+static void RawSaw(int vk, bool down) {
+    if (sentDir[vk] == (down ? 1 : 2) && GetTickCount64() - sentTick[vk] < 50) rawEcho[vk] = true;
+    rawDown[vk] = down;
 }
 
-// From the hooks, which see real presses even when a game takes the mouse as raw input (GetAsyncKeyState
-// can lag seconds behind then) and skip our own injected clicks.
+static LRESULT CALLBACK RawProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    RAWINPUT ri;
+    UINT sz = sizeof ri;
+    if (msg != WM_INPUT || GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) == (UINT)-1 ||
+        !ri.header.hDevice) // no device: injected
+        return DefWindowProcW(w, msg, wp, lp);
+    if (ri.header.dwType == RIM_TYPEMOUSE) {
+        const RAWMOUSE& m = ri.data.mouse;
+        rawMouse = true;
+        bool swap = GetSystemMetrics(SM_SWAPBUTTON); // raw buttons are physical; keys are bound to logical ones
+        auto button = [&](USHORT dn, USHORT up, int vk) {
+            if (m.usButtonFlags & dn) RawSaw(vk, true);
+            if (m.usButtonFlags & up) RawSaw(vk, false);
+        };
+        button(RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, swap ? VK_RBUTTON : VK_LBUTTON);
+        button(RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, swap ? VK_LBUTTON : VK_RBUTTON);
+        button(RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, VK_MBUTTON);
+        button(RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, VK_XBUTTON1);
+        button(RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, VK_XBUTTON2);
+        if (wheelShown && !(m.usFlags & MOUSE_MOVE_ABSOLUTE)) { // steers the profile wheel, even with the cursor locked
+            wheelDX += m.lLastX;
+            wheelDY += m.lLastY;
+        }
+    } else if (ri.header.dwType == RIM_TYPEKEYBOARD) {
+        const RAWKEYBOARD& k = ri.data.keyboard;
+        int vk = k.VKey;
+        bool e0 = k.Flags & RI_KEY_E0;
+        if (vk == VK_SHIFT) vk = k.MakeCode == 0x36 ? VK_RSHIFT : VK_LSHIFT; // the left/right keys, like the hooks
+        if (vk == VK_CONTROL) vk = e0 ? VK_RCONTROL : VK_LCONTROL;
+        if (vk == VK_MENU) vk = e0 ? VK_RMENU : VK_LMENU;
+        if (vk > 0 && vk < 255) {
+            rawKeys = true;
+            RawSaw(vk, !(k.Flags & RI_KEY_BREAK));
+        }
+    }
+    return DefWindowProcW(w, msg, wp, lp);
+}
+
+static std::atomic<bool> rawOk;
+
+// Own thread so a busy UI thread can never stall system-wide input, or the raw input.
+static void HookThread() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL); // answer fast, or Windows skips the hook
+    hooked = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0) &&
+             SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = RawProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"MouseDownRaw";
+    RegisterClassW(&wc);
+    HWND w = CreateWindowW(L"MouseDownRaw", L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    RAWINPUTDEVICE rid[2] = {{1, 2, RIDEV_INPUTSINK, w}, {1, 6, RIDEV_INPUTSINK, w}}; // mouse, keyboard; in the background too
+    rawOk = w && RegisterRawInputDevices(rid, 2, sizeof rid[0]);
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) DispatchMessageW(&m);
+}
+
+// Held, as the player is pressing it. Raw input when it's delivering that kind of device, else the hooks
+// (they skip our own injected clicks too), else GetAsyncKeyState.
 static bool Down(int vk) {
     if (!vk) return false;
-    if (!hooked) return GetAsyncKeyState(vk) & 0x8000;
-    switch (vk) { // LL hooks report the left/right variants only
-    case VK_SHIFT: return phys[VK_LSHIFT] || phys[VK_RSHIFT];
-    case VK_CONTROL: return phys[VK_LCONTROL] || phys[VK_RCONTROL];
-    case VK_MENU: return phys[VK_LMENU] || phys[VK_RMENU];
+    bool mouse = vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+    bool raw = rawOk && (mouse ? rawMouse : rawKeys) && !rawEcho[vk & 255];
+    const std::atomic<bool>* st = raw ? rawDown : hooked ? phys : nullptr;
+    if (!st) return GetAsyncKeyState(vk) & 0x8000;
+    switch (vk) { // only the left/right variants are tracked
+    case VK_SHIFT: return st[VK_LSHIFT] || st[VK_RSHIFT];
+    case VK_CONTROL: return st[VK_LCONTROL] || st[VK_RCONTROL];
+    case VK_MENU: return st[VK_LMENU] || st[VK_RMENU];
     }
-    return phys[vk];
+    return st[vk];
 }
 
 static bool Extended(int vk) { // keys whose scan code needs the E0 prefix
@@ -521,6 +588,8 @@ static bool Extended(int vk) { // keys whose scan code needs the E0 prefix
 
 // Press or release vk (mouse button or key) via SendInput.
 static void SendKey(int vk, bool down) {
+    sentTick[vk & 255] = GetTickCount64();
+    sentDir[vk & 255] = down ? 1 : 2;
     INPUT ev{};
     DWORD dn = 0, up = 0;
     switch (vk) {
@@ -1752,7 +1821,7 @@ static void Frame(float W) {
             Card(840, 116, 400, 296, L"TIMING & SMOOTHING");
         }
     } else {
-        Card(20, 64, 380, 600, L"GENERAL");
+        Card(20, 64, 380, 636, L"GENERAL");
         KeyBind(L"On / off", cfg.toggleKey, 36, 100, 348);
         KeyBind(L"Hold to pause", cfg.pauseKey, 36, 144, 348);
         Slider(sensDef, cfg.sens, 36, 190, 348);
@@ -1785,6 +1854,10 @@ static void Frame(float W) {
         }
         Text(L"Needed when a game runs as admin: Windows keeps", R(36, 612, 348, 18), fSmall, MUTED);
         Text(L"other programs from seeing its input or clicking in it", R(36, 630, 348, 18), fSmall, MUTED);
+        auto src = [](bool raw) { return raw ? L"raw input" : hooked ? L"hooks" : L"key state (may lag in games)"; };
+        wchar_t inputLine[96];
+        swprintf_s(inputLine, L"Input  ·  mouse: %s  ·  keys: %s", src(rawOk && rawMouse), src(rawOk && rawKeys));
+        Text(inputLine, R(36, 664, 348, 18), fSmall, rawOk && rawMouse ? GREEN : ORANGE);
 
         Card(420, 64, 380, 460, L"SWITCHING", L"Backspace clears");
         KeyBind(L"Next profile", cfg.nextKey, 436, 100, 348);
@@ -2033,13 +2106,6 @@ static void DrawWheel(float w, float) {
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
 }
 
-// Raw mouse motion steers the wheel. Only subscribed while it's open: a high-rate gaming mouse
-// would otherwise send the UI thread thousands of messages a second for nothing.
-static void RawMouse(bool on) {
-    RAWINPUTDEVICE rid{1, 2, (DWORD)(on ? RIDEV_INPUTSINK : RIDEV_REMOVE), on ? hwnd : nullptr}; // generic desktop / mouse
-    RegisterRawInputDevices(&rid, 1, sizeof rid);
-}
-
 static bool caretShown;
 
 // In-game HUD: active profile, its number and status, in the corner of the game's monitor.
@@ -2135,12 +2201,18 @@ static void OverlayTick() {
         wheelOpen = wheelShown = true;
         wheelStep = 0;
         wheelClick = false;
-        RawMouse(true);
+        wheelDX = wheelDY = 0;
         wheelX = wheelY = wheelOpenT = 0;
         wheelSel = -1;
         std::fill(std::begin(wheelHl), std::end(wheelHl), 0.f);
     }
     if (!wheelOpen) return;
+    wheelX += wheelDX.exchange(0);
+    wheelY += wheelDY.exchange(0);
+    if (float len = std::hypot(wheelX, wheelY); len > 100) { // cap so changing direction responds right away
+        wheelX *= 100 / len;
+        wheelY *= 100 / len;
+    }
     if (int st = wheelStep.exchange(0)) { // scrolling steps the pick, as if the mouse had moved that way
         int k = wheelSel;
         if (k < 0) { // start from the current profile's slice (or just before the first)
@@ -2172,7 +2244,6 @@ static void OverlayTick() {
     }
     wheelLatch = click;
     wheelOpen = wheelShown = false;
-    RawMouse(false);
     ShowWindow(wheelWnd, SW_HIDE);
     if (wheelSel < 0) return;
     wchar_t msg[64];
@@ -2319,21 +2390,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (notify) Notify(msg, wp == EV_ON ? GREEN : wp == EV_OFF ? RED : ACCENT);
         if (sound) Chime((int)wp);
         return 0;
-    }
-    case WM_INPUT: { // raw mouse motion steers the wheel, even while a game has the cursor locked
-        RAWINPUT ri;
-        UINT sz = sizeof ri;
-        if (wheelOpen && GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
-            ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
-            wheelX += ri.data.mouse.lLastX;
-            wheelY += ri.data.mouse.lLastY;
-            float len = std::hypot(wheelX, wheelY);
-            if (len > 100) { // cap so changing direction responds right away
-                wheelX *= 100 / len;
-                wheelY *= 100 / len;
-            }
-        }
-        break;
     }
     case WM_APP + 2: { // update installed: save, start the new exe, quit
         KillTimer(h, 3);
