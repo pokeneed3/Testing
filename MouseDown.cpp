@@ -17,6 +17,8 @@
 #include <cwctype>
 #include <mutex>
 #include <random>
+#include <cstdarg>
+#include <deque>
 #include <string>
 #include <thread>
 #pragma comment(lib, "user32")
@@ -425,6 +427,45 @@ enum { EV_ON = 1, EV_OFF, EV_PROFILE, EV_SLOT }; // wParam of WM_APP + 1
 static std::atomic<bool> phys[256];
 static std::atomic<bool> hooked;
 
+// ---------- diagnostic log ----------
+
+// Off unless switched on in Settings. Kept in memory (the last few thousand lines) for the player to copy and
+// send. Only the keys the running profile uses are logged, never typing in general.
+static std::atomic<bool> diagOn;
+static std::mutex diagMu;
+static std::deque<std::string> diagLines;
+static LARGE_INTEGER diagFreq, diagT0;
+static std::atomic<int> diagWatch[4]; // hold, require, spam hold, spam require of the running profile
+
+static void Diag(const char* fmt, ...) {
+    if (!diagOn) return;
+    char msg[256], line[300];
+    va_list a;
+    va_start(a, fmt);
+    vsnprintf(msg, sizeof msg, fmt, a);
+    va_end(a);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    snprintf(line, sizeof line, "%10.1f ms  %s", (now.QuadPart - diagT0.QuadPart) * 1000.0 / diagFreq.QuadPart, msg);
+    std::lock_guard<std::mutex> l(diagMu);
+    diagLines.push_back(line);
+    if (diagLines.size() > 5000) diagLines.pop_front();
+}
+
+static bool Watched(int vk) {
+    for (auto& w : diagWatch)
+        if (w && w == vk) return true;
+    return false;
+}
+
+static std::string VkLabel(int vk) {
+    static const char* const mouse[] = {"none", "Left Mouse", "Right Mouse", "?", "Middle Mouse", "Mouse 4", "Mouse 5"};
+    if (vk >= 0 && vk <= 6) return mouse[vk];
+    char b[16];
+    snprintf(b, sizeof b, "key 0x%02X", vk);
+    return b;
+}
+
 // Quick switching. The hooks only flag what was asked for (they must return fast); the engine applies it.
 static std::atomic<int> quickKeyNow;          // engine keeps this at cfg.quickKey (0 while capturing keys)
 static std::atomic<int> quickJump{-1};        // profile index picked with quick key + 1-9
@@ -467,12 +508,17 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
             static int part; // fine-step wheels send fractions of a notch
             for (part += std::abs((short)HIWORD(m->mouseData)); part >= WHEEL_DELTA; part -= WHEEL_DELTA) gameScroll++;
         }
+        int bvk = 0;
+        bool bdown = wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_XBUTTONDOWN;
         switch (wp) {
-        case WM_LBUTTONDOWN: case WM_LBUTTONUP: phys[VK_LBUTTON] = wp == WM_LBUTTONDOWN; break;
-        case WM_RBUTTONDOWN: case WM_RBUTTONUP: phys[VK_RBUTTON] = wp == WM_RBUTTONDOWN; break;
-        case WM_MBUTTONDOWN: case WM_MBUTTONUP: phys[VK_MBUTTON] = wp == WM_MBUTTONDOWN; break;
-        case WM_XBUTTONDOWN: case WM_XBUTTONUP:
-            phys[HIWORD(m->mouseData) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2] = wp == WM_XBUTTONDOWN; break;
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: bvk = VK_LBUTTON; break;
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: bvk = VK_RBUTTON; break;
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: bvk = VK_MBUTTON; break;
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: bvk = HIWORD(m->mouseData) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2; break;
+        }
+        if (bvk) {
+            phys[bvk] = bdown;
+            if (diagOn && Watched(bvk)) Diag("hook    %s %s", VkLabel(bvk).c_str(), bdown ? "down" : "up");
         }
     }
     return CallNextHookEx(nullptr, code, wp, lp);
@@ -494,6 +540,7 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
             eaten[vk] = false;
             return 1;
         }
+        if (diagOn && phys[vk] != down && Watched(vk)) Diag("hook    %s %s", VkLabel(vk).c_str(), down ? "down" : "up");
         phys[vk] = down;
     }
     return CallNextHookEx(nullptr, code, wp, lp);
@@ -510,6 +557,7 @@ static std::atomic<ULONGLONG> sentTick[256];
 static std::atomic<int> sentDir[256]; // last thing SendKey did to each key: 1 pressed, 2 released
 static std::atomic<bool> rawEcho[256];
 static void RawSaw(int vk, bool down) {
+    if (diagOn && rawDown[vk] != down && Watched(vk)) Diag("raw     %s %s", VkLabel(vk).c_str(), down ? "down" : "up");
     if (sentDir[vk] == (down ? 1 : 2) && GetTickCount64() - sentTick[vk] < 50) rawEcho[vk] = true;
     rawDown[vk] = down;
 }
@@ -617,6 +665,9 @@ static void SendKey(int vk, bool down) {
 }
 
 // Open the HID board's serial port. \\.\ prefix is needed for COM10+.
+static std::atomic<HANDLE> serialReady{INVALID_HANDLE_VALUE}; // opened off the engine thread, for it to pick up
+static std::atomic<bool> serialOpening;
+
 static HANDLE OpenSerial(const wchar_t* port) {
     if (!*port) return INVALID_HANDLE_VALUE;
     wchar_t path[32];
@@ -630,7 +681,8 @@ static HANDLE OpenSerial(const wchar_t* port) {
     dcb.Parity = NOPARITY;
     dcb.StopBits = ONESTOPBIT;
     SetCommState(h, &dcb);
-    COMMTIMEOUTS to{}; // all zero: writes return at once, never block the engine tick
+    COMMTIMEOUTS to{};
+    to.WriteTotalTimeoutConstant = 2; // a board that stops reading can't hold up the engine tick for long
     SetCommTimeouts(h, &to);
     return h;
 }
@@ -770,6 +822,20 @@ static void Engine(HWND hwnd) {
         lastRun = run;
         QueryPerformanceCounter(&now);
         double nowMs = ms(now.QuadPart);
+        if (diagOn) {
+            static double lastTick;
+            static bool seen[4];
+            if (lastTick > 0 && nowMs - lastTick > 40) Diag("engine ran late: %.0f ms since its last tick", nowMs - lastTick);
+            lastTick = nowMs;
+            int keys[4] = {p.holdKey, p.requireKey, p.spamOn ? p.spamTrigger : 0, p.spamOn ? p.spamRequire : 0};
+            for (int k = 0; k < 4; k++) {
+                diagWatch[k] = keys[k];
+                bool d = Down(keys[k]), dup = false;
+                for (int j = 0; j < k; j++) dup |= keys[j] == keys[k];
+                if (keys[k] && !dup && d != seen[k]) Diag("engine  %s %s", VkLabel(keys[k]).c_str(), d ? "down" : "up");
+                seen[k] = d;
+            }
+        }
 
         // spam first, so a linked pull starts on the same tick as the first click
         bool paused = Down(c.pauseKey) && !cap;
@@ -789,6 +855,7 @@ static void Engine(HWND hwnd) {
                            restart);
         if (restart) wasActive = false;
         if (active != pulling) {
+            Diag(active ? "PULL ON" : "pull off");
             pulling = active;
             PostMessageW(hwnd, WM_APP, 0, 0);
         }
@@ -807,8 +874,22 @@ static void Engine(HWND hwnd) {
                 };
                 ox = offset();
                 oy = offset();
-                if (serial == INVALID_HANDLE_VALUE) serial = OpenSerial(c.port); // (re)connect per activation
+                if (serial == INVALID_HANDLE_VALUE && *c.port && !serialOpening) { // (re)connect, off this thread:
+                    serialOpening = true;                                          // a stuck port can take seconds
+                    std::thread([port = std::wstring(c.port)] {
+                        LARGE_INTEGER f, a, b;
+                        QueryPerformanceFrequency(&f);
+                        QueryPerformanceCounter(&a);
+                        HANDLE h = OpenSerial(port.c_str());
+                        QueryPerformanceCounter(&b);
+                        Diag("HID port %ls %s after %.0f ms", port.c_str(), h != INVALID_HANDLE_VALUE ? "opened" : "failed",
+                             (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart);
+                        serialReady = h;
+                        serialOpening = false;
+                    }).detach();
+                }
             }
+            if (serial == INVALID_HANDLE_VALUE) serial = serialReady.exchange(INVALID_HANDLE_VALUE); // until then: SendInput
             double tm = ms(now.QuadPart - t0.QuadPart), dt = ms(now.QuadPart - last.QuadPart);
             last = now;
             if (p.mode == 2 && tm >= p.startDelay + (p.duration > 0 ? p.duration : TAP_MS)) trig.latched = false; // tap done
@@ -838,7 +919,11 @@ static void Engine(HWND hwnd) {
                 if (serial != INVALID_HANDLE_VALUE) { // real USB mouse: the game can't tell it from hardware
                     unsigned char pkt[3] = {0x80, (unsigned char)(char)ix, (unsigned char)(char)iy};
                     DWORD wr;
-                    if (!WriteFile(serial, pkt, 3, &wr, nullptr)) { CloseHandle(serial); serial = INVALID_HANDLE_VALUE; }
+                    if (!WriteFile(serial, pkt, 3, &wr, nullptr) || wr != 3) {
+                        Diag("HID port write failed, closing it");
+                        CloseHandle(serial);
+                        serial = INVALID_HANDLE_VALUE;
+                    }
                 } else {
                     INPUT in{}; // no board: fall back to injection (desktop + games that don't filter it)
                     in.type = INPUT_MOUSE;
@@ -866,6 +951,7 @@ static void Engine(HWND hwnd) {
         if (!spam) spamAt = 0; // first click fires right on press
         if (spamWas && !spam && spamLast && Down(spamLast))
             SendKey(spamLast, true); // still physically held: hand the button back down to the game
+        if (spam != spamWas) Diag(spam ? "SPAM ON" : "spam off");
         spamWas = spam;
         if (spam) spamLast = p.spamKey;
 
@@ -1661,6 +1747,39 @@ static std::wstring Details(const Config& c, int i) {
     return s;
 }
 
+static void StartDiag(bool on) {
+    if (!on) {
+        Diag("log stopped");
+        diagOn = false;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> l(diagMu);
+        diagLines.clear();
+        QueryPerformanceFrequency(&diagFreq);
+        QueryPerformanceCounter(&diagT0);
+    }
+    diagOn = true;
+    Diag("log started: raw input %s (mouse %s, keys %s), hooks %s, running as admin: %s", rawOk ? "on" : "OFF",
+         rawMouse ? "yes" : "no", rawKeys ? "yes" : "no", hooked ? "on" : "OFF", selfAdmin ? "yes" : "no");
+}
+
+static void CopyDiag() { // to the clipboard, ready to paste into a message
+    std::wstring out;
+    size_t n;
+    {
+        std::lock_guard<std::mutex> l(diagMu);
+        n = diagLines.size();
+        for (auto& line : diagLines) {
+            out.append(line.begin(), line.end());
+            out += L"\r\n";
+        }
+    }
+    CopyText(out);
+    swprintf_s(toastReq, L"Log copied (%zu lines)", n);
+    toastReqColor = ACCENT;
+}
+
 static void RunProfileCmd() {
     Profile* p = cfg.p;
     int& n = cfg.n;
@@ -2109,7 +2228,7 @@ static void Frame(float W) {
             Card(840, 116, 400, 296, L"TIMING & SMOOTHING");
         }
     } else {
-        Card(20, 64, 380, 636, L"GENERAL");
+        Card(20, 64, 380, 726, L"GENERAL");
         KeyBind(L"On / off", cfg.toggleKey, 36, 100, 348);
         KeyBind(L"Hold to pause", cfg.pauseKey, 36, 144, 348);
         Slider(sensDef, cfg.sens, 36, 190, 348);
@@ -2146,6 +2265,17 @@ static void Frame(float W) {
         wchar_t inputLine[96];
         swprintf_s(inputLine, L"Input  ·  mouse: %s  ·  keys: %s", src(rawOk && rawMouse), src(rawOk && rawKeys));
         Text(inputLine, R(36, 664, 348, 18), fSmall, rawOk && rawMouse ? GREEN : ORANGE);
+        static bool diagUi;
+        Toggle(L"Record diagnostic log", diagUi, 36, 694, 348);
+        if (diagUi != diagOn) StartDiag(diagUi);
+        size_t lines;
+        {
+            std::lock_guard<std::mutex> l(diagMu);
+            lines = diagLines.size();
+        }
+        wchar_t copyLabel[48];
+        swprintf_s(copyLabel, L"Copy log  (%zu lines)", lines);
+        if (TextButton(copyLabel, R(36, 738, 348, 34), lines > 0)) CopyDiag();
 
         Card(420, 64, 380, 460, L"SWITCHING", L"Backspace clears");
         KeyBind(L"Next profile", cfg.nextKey, 436, 100, 348);
@@ -2470,6 +2600,18 @@ static void OverlayTick() {
         nextAdminCheck = now + 500;
         DWORD pid;
         bool need = ForegroundOutranksUs(pid);
+        static DWORD loggedPid;
+        if (diagOn && pid != loggedPid) {
+            loggedPid = pid;
+            wchar_t path[MAX_PATH] = L"?";
+            DWORD len = MAX_PATH;
+            if (HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+                if (!QueryFullProcessImageNameW(proc, 0, path, &len)) wcscpy_s(path, L"?");
+                CloseHandle(proc);
+            }
+            const wchar_t* name = wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path;
+            Diag("focus   %ls (pid %lu)%s", name, pid, need ? ", runs as admin above us" : "");
+        }
         if (need != adminNeeded) {
             adminNeeded = need;
             InvalidateRect(hwnd, nullptr, FALSE);
