@@ -1062,6 +1062,7 @@ static bool numSeen, numCancel;
 static bool bindArmed, saveReq, onTopApplied;
 static LPCWSTR cursor = IDC_ARROW;
 static int headerCmd, profileCmd; // run after the frame so nothing shifts mid-draw
+static int tab = 1; // 0 = the profile list, 1 = edit the selected one, 2 = settings
 
 static void SyncCapture() { capturing = editTarget || bindTarget; }
 
@@ -1510,6 +1511,18 @@ static void ProfileLabel(const Config& c, int i, wchar_t* out, size_t cap) {
     else wcscpy_s(out, cap, n);
 }
 
+// Right-click menu for a profile or group (menuFor = its index), or the list itself (MENU_LIST). Drawn last,
+// over everything, by DrawMenu; what's picked runs after the frame (RunMenuCmd).
+const int MENU_NONE = -1, MENU_LIST = -2;
+static int menuFor = MENU_NONE, menuArm, menuCmd, menuCmdFor; // menuArm: Delete waiting for its second click
+static bool menuJustOpened;
+static D2D1_POINT_2F menuAt;
+
+static void OpenMenu(int forIdx) {
+    menuFor = forIdx, menuArm = 0, menuJustOpened = true;
+    menuAt = {in.mx, in.my};
+}
+
 // Dropdown for picking a profile: a group slot's (None + the normal profiles), or which one to edit (all).
 // The open list is drawn last, over everything, by DrawDropdown.
 static int* dropTarget; // what picking writes; nullptr = closed
@@ -1542,6 +1555,10 @@ static void Chevron(float x, float cy, bool up) {
 static void Dropdown(int& idx, D2D1_RECT_F b, int kind, bool active) {
     bool hover = In(b), open = dropTarget == &idx;
     if (hover) cursor = IDC_HAND;
+    if (hover && in.rpressed && idx >= 0 && idx < cfg.n) {
+        dropTarget = nullptr;
+        OpenMenu(idx);
+    }
     if (hover && in.pressed) {
         dropTarget = open ? nullptr : &idx;
         if (!open) { // start scrolled so the current pick shows
@@ -1563,7 +1580,7 @@ static void Dropdown(int& idx, D2D1_RECT_F b, int kind, bool active) {
 
 // The open list, over everything. popPress / popWheel: the click and scroll that landed on it this frame;
 // pressedElsewhere: a click anywhere else, which closes it (except on its own button, which toggles it).
-static void DrawDropdown(bool popPress, float popWheel, bool pressedElsewhere) {
+static void DrawDropdown(bool popPress, bool popRPress, float popWheel, bool pressedElsewhere) {
     if (!dropTarget) return;
     if ((dropTarget != &cfg.cur && dropFor != cfg.cur) || (pressedElsewhere && !InRaw(dropAnchor))) {
         dropTarget = nullptr;
@@ -1589,6 +1606,10 @@ static void DrawDropdown(bool popPress, float popWheel, bool pressedElsewhere) {
             *target = v;
             dropTarget = nullptr;
             saveReq = true;
+        }
+        if (hover && popRPress && v >= 0) {
+            dropTarget = nullptr;
+            OpenMenu(v);
         }
         Fill(r, 6, sel ? ACCENT : hover ? BTN_HOVER : CARD);
         if (v < 0) {
@@ -1637,6 +1658,15 @@ static void RunProfileCmd() {
         InsertProfile(cfg, n, Profile{});
         swprintf_s(p[n - 1].name, L"Profile %d", n);
         cur = n - 1;
+    } else if (profileCmd == 7 && n < MAX_PROFILES) { // paste the clipboard in as a new profile
+        Profile q{};
+        bool ok = ImportProfile(PasteText().c_str(), q);
+        if (ok) {
+            InsertProfile(cfg, n, q);
+            cur = n - 1;
+        }
+        wcscpy_s(toastReq, ok ? L"Profile pasted" : L"No profile on the clipboard");
+        toastReqColor = ok ? GREEN : RED;
     } else if (profileCmd == 6 && n < MAX_PROFILES) { // new group, its slots on the first two normal profiles
         InsertProfile(cfg, n, Profile{});
         Profile& g = p[n - 1];
@@ -1669,6 +1699,169 @@ static void RunProfileCmd() {
     profileCmd = 0;
 }
 
+enum { M_EDIT = 1, M_RENAME, M_DUP, M_COPY, M_PASTE, M_UP, M_DOWN, M_NEWGROUP, M_SWAP, M_DELETE, M_NEWPROFILE, M_NEWGROUPEMPTY,
+       M_PASTENEW };
+struct MenuItem { const wchar_t* label; int id; bool on, danger; }; // label nullptr = separator
+
+static int MenuItems(MenuItem* out) {
+    int m = 0, i = menuFor;
+    bool room = cfg.n < MAX_PROFILES;
+    auto add = [&](const wchar_t* label, int id, bool on = true, bool danger = false) { out[m++] = {label, id, on, danger}; };
+    if (i == MENU_LIST) {
+        add(L"New profile", M_NEWPROFILE, room);
+        add(L"New group", M_NEWGROUPEMPTY, room);
+        add(L"Paste as new profile", M_PASTENEW, room);
+        return m;
+    }
+    add(L"Edit", M_EDIT);
+    add(L"Rename", M_RENAME);
+    add(nullptr, 0);
+    if (cfg.p[i].group) add(L"Swap slots", M_SWAP);
+    else add(L"New group with this", M_NEWGROUP, room);
+    add(L"Duplicate", M_DUP, room);
+    add(L"Copy", M_COPY);
+    add(L"Paste over this", M_PASTE);
+    add(nullptr, 0);
+    add(L"Move up", M_UP, i > 0);
+    add(L"Move down", M_DOWN, i < cfg.n - 1);
+    add(nullptr, 0);
+    add(L"Delete", M_DELETE, cfg.n > 1, true);
+    return m;
+}
+
+const float MENU_W = 220, MENU_ROW = 30, MENU_SEP = 9, MENU_HEAD = 28;
+
+static D2D1_RECT_F MenuRect() { // at the mouse, kept inside the window
+    MenuItem items[16];
+    int m = MenuItems(items);
+    float h = 8 + (menuFor >= 0 ? MENU_HEAD : 0);
+    for (int k = 0; k < m; k++) h += items[k].label ? MENU_ROW : MENU_SEP;
+    float x = std::min(menuAt.x, WIN_W - MENU_W - 8), y = std::min(menuAt.y, WIN_H - h - 8);
+    return R(x, y, MENU_W, h);
+}
+
+// popPress: a left click on the menu this frame; clickedElsewhere: any click off it, which closes it.
+static void DrawMenu(bool popPress, bool clickedElsewhere) {
+    if (menuFor == MENU_NONE) return;
+    bool fresh = menuJustOpened;
+    menuJustOpened = false;
+    if ((clickedElsewhere && !fresh) || menuFor >= cfg.n) {
+        menuFor = MENU_NONE;
+        return;
+    }
+    MenuItem items[16];
+    int m = MenuItems(items), forIdx = menuFor;
+    D2D1_RECT_F box = MenuRect();
+    float w = box.right - box.left, y = box.top + 4;
+    dropOn = false; // its own items take the mouse
+    Fill(R(box.left + 2, box.top + 4, w, box.bottom - box.top), 10, 0x000000, .35f); // shadow
+    Fill(box, 10, CARD);
+    Stroke(box, 10, ACCENT);
+    if (forIdx >= 0) {
+        const Profile& q = cfg.p[forIdx];
+        Text(*q.name ? q.name : L"Untitled", R(box.left + 14, y, w - 90, MENU_HEAD - 4), fSmall, MUTED);
+        Text(q.group ? L"Group" : L"Profile", R(box.right - 84, y, 70, MENU_HEAD - 4), fSmall, q.group ? ACCENT : DISABLED,
+             DWRITE_TEXT_ALIGNMENT_TRAILING);
+        y += MENU_HEAD;
+    }
+    for (int k = 0; k < m; k++) {
+        const MenuItem& it = items[k];
+        if (!it.label) {
+            Line(box.left + 10, y + MENU_SEP / 2, box.right - 10, y + MENU_SEP / 2, BORDER);
+            y += MENU_SEP;
+            continue;
+        }
+        D2D1_RECT_F r = R(box.left + 4, y, w - 8, MENU_ROW - 2);
+        bool hover = it.on && In(R(r.left, r.top, r.right - r.left, MENU_ROW)), armed = it.id == M_DELETE && menuArm == M_DELETE;
+        if (hover) cursor = IDC_HAND;
+        if (hover && popPress) {
+            if (it.id == M_DELETE && !armed) { // a slip shouldn't lose a profile: ask for a second click
+                menuArm = M_DELETE;
+                armed = true;
+            } else {
+                menuCmd = it.id, menuCmdFor = forIdx;
+                menuFor = MENU_NONE;
+            }
+        }
+        Fill(r, 6, armed ? RED : hover ? (it.danger ? RED_SOFT : BTN_HOVER) : CARD);
+        Text(armed ? L"Click again to delete" : it.label, R(r.left + 10, r.top, r.right - r.left - 20, r.bottom - r.top), fValue,
+             !it.on ? DISABLED : armed ? WHITE : it.danger ? RED : TEXT);
+        y += MENU_ROW;
+    }
+}
+
+// What the menu picked, for profile i (or the list). Copy, paste and moving leave the active profile alone.
+static void RunMenuCmd() {
+    int id = menuCmd, i = menuCmdFor;
+    menuCmd = 0;
+    if (!id || i >= cfg.n) return;
+    Profile* p = cfg.p;
+    int& n = cfg.n;
+    int& cur = cfg.cur;
+    switch (id) {
+    case M_EDIT:
+        cur = i, tab = 1;
+        break;
+    case M_RENAME: // open it on Edit with its name selected, ready to type over
+        cur = i, tab = 1;
+        editTarget = p[i].name, editMax = NAME_LEN;
+        SetSel(0, (int)wcslen(p[i].name));
+        SyncCapture();
+        break;
+    case M_DUP:
+        if (n >= MAX_PROFILES) break;
+        InsertProfile(cfg, i + 1, p[i]);
+        swprintf_s(p[i + 1].name, L"%.15s copy", p[i].name);
+        p[i + 1].hotkey = 0; // two profiles on one hotkey would fight
+        cur = i + 1;
+        break;
+    case M_COPY:
+        CopyText(ExportProfile(p[i]));
+        wcscpy_s(toastReq, L"Profile copied");
+        toastReqColor = ACCENT;
+        break;
+    case M_PASTE: {
+        bool ok = ImportProfile(PasteText().c_str(), p[i]);
+        wcscpy_s(toastReq, ok ? L"Profile pasted" : L"No profile on the clipboard");
+        toastReqColor = ok ? GREEN : RED;
+        break;
+    }
+    case M_UP:
+    case M_DOWN: {
+        int j = id == M_UP ? i - 1 : i + 1;
+        if (j < 0 || j >= n) break;
+        SwapProfiles(cfg, i, j);
+        if (cur == i) cur = j;
+        else if (cur == j) cur = i;
+        break;
+    }
+    case M_NEWGROUP: { // a group with this profile in slot 1
+        if (n >= MAX_PROFILES) break;
+        InsertProfile(cfg, n, Profile{});
+        Profile& g = p[n - 1];
+        g.group = true;
+        g.child[0] = i;
+        swprintf_s(g.name, L"%.14s group", p[i].name);
+        cur = n - 1, tab = 1;
+        break;
+    }
+    case M_SWAP: // the same slot stays active, now holding the other profile
+        std::swap(p[i].child[0], p[i].child[1]);
+        break;
+    case M_DELETE:
+        if (n <= 1) break;
+        DeleteProfile(cfg, i);
+        if (cur > i) cur--;
+        cur = std::min(cur, n - 1);
+        break;
+    case M_NEWPROFILE: profileCmd = 1; break;
+    case M_NEWGROUPEMPTY: profileCmd = 6; break;
+    case M_PASTENEW: profileCmd = 7; break;
+    }
+    saveReq = true;
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
+
 static void Frame(float W) {
     cursor = IDC_ARROW;
     numSeen = false;
@@ -1677,15 +1870,15 @@ static void Frame(float W) {
     ACCENT_SOFT = accents[cfg.accent][1];
     rt->Clear(D2D1::ColorF(BG));
     dropOn = false;
-    bool pressedAny = in.pressed, popPress = false;
+    bool pressedAny = in.pressed, rpressedAny = in.rpressed, popPress = false, popRPress = false;
     float popWheel = 0;
-    if (dropTarget) { // an open dropdown list is on top: a click or scroll over it is only for it
+    if (dropTarget || menuFor != MENU_NONE) { // an open list or menu is on top: a click or scroll over it is only for it
         int items[MAX_PROFILES + 1];
-        dropBlock = DropRect(DropItems(items));
+        dropBlock = dropTarget ? DropRect(DropItems(items)) : MenuRect();
         dropOn = true;
         if (InRaw(dropBlock)) {
-            popPress = in.pressed, popWheel = in.wheel;
-            in.pressed = false, in.wheel = 0;
+            popPress = in.pressed, popRPress = in.rpressed, popWheel = in.wheel;
+            in.pressed = in.rpressed = false, in.wheel = 0;
         }
     }
     Profile& g = cfg.p[cfg.cur]; // the selected list entry: a profile or a group
@@ -1728,7 +1921,6 @@ static void Frame(float W) {
     Line(W - 38, 23, W - 28, 33, TEXT, 1.2f);
     Line(W - 38, 33, W - 28, 23, TEXT, 1.2f);
 
-    static int tab = 1; // 0 = the profile list, 1 = edit the selected one, 2 = settings
     static const wchar_t* const tabNames[] = {L"Profiles", L"Edit", L"Settings"};
     Fill(TABS, 8, BTN);
     Stroke(TABS, 8, BORDER);
@@ -1737,6 +1929,7 @@ static void Frame(float W) {
         if (Button(t) && tab != k) {
             tab = k;
             dropTarget = nullptr;
+            menuFor = MENU_NONE;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         if (tab == k) Fill(t, 6, ACCENT);
@@ -1765,7 +1958,7 @@ static void Frame(float W) {
         if (TextButton(L"Paste", R(536, 64, 72, 34))) profileCmd = 5;
         Segment(L"Show", cfg.listShow, shows, 900, 65, 340, 80);
 
-        Card(20, 116, 1220, 696, L"PROFILES", L"click to select  ·  double-click to edit  ·  drag to reorder");
+        Card(20, 116, 1220, 696, L"PROFILES", L"click to select  ·  double-click to edit  ·  drag to reorder  ·  right-click for more");
         static const std::pair<const wchar_t*, float> heads[] = {{L"#", 40}, {L"Name", 68}, {L"Type", 298}, {L"Details", 378}};
         for (auto& [label, x] : heads) Text(label, R(x, 148, 200, 18), fSmall, DISABLED);
         Text(L"Hotkey", R(1082, 148, 140, 18), fSmall, DISABLED, DWRITE_TEXT_ALIGNMENT_TRAILING);
@@ -1784,6 +1977,7 @@ static void Frame(float W) {
             D2D1_RECT_F r = R(28, 172 + v * 38.f - scroll, 1204, 34);
             if (r.bottom < list.top || r.top > list.bottom) continue;
             bool sel = cfg.cur == i, hover = In(r) && In(list);
+            if (hover && in.rpressed) OpenMenu(i);
             if (hover && Button(r)) {
                 cfg.cur = i;
                 if (in.dbl) tab = 1, dragRow = -1; // double-click: open it
@@ -1800,6 +1994,7 @@ static void Frame(float W) {
                                DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
         if (!nv) Text(L"Nothing to show here: pick All or make one", R(40, 180, 600, 34), fLabel, MUTED);
+        if (in.rpressed && In(list) && !menuJustOpened) OpenMenu(MENU_LIST); // right-click below the rows
         rt->PopAxisAlignedClip();
         if (maxScroll > 0) { // scrollbar
             float th = listH * listH / (listH + maxScroll), ty = list.top + 4 + (listH - th) * scroll / maxScroll;
@@ -1975,7 +2170,9 @@ static void Frame(float W) {
         if (editTarget == numBuf) editTarget = nullptr;
         SyncCapture();
     }
-    DrawDropdown(popPress, popWheel, pressedAny && !popPress);
+    DrawDropdown(popPress, popRPress, popWheel, pressedAny && !popPress);
+    DrawMenu(popPress, (pressedAny || rpressedAny) && !popPress && !popRPress);
+    RunMenuCmd();
     if (profileCmd) dropTarget = nullptr; // the list is about to change under it
     RunProfileCmd();
 
