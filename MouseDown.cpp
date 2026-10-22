@@ -33,7 +33,7 @@ const int MAX_PROFILES = 100, NAME_LEN = 20, OFF_BITS = 10, ACCENTS = 5; // pony
 
 struct Profile {
     wchar_t name[NAME_LEN + 4] = L"Default";
-    int holdKey = VK_XBUTTON1, requireKey = 0, hotkey = 0, mode = 0; // mode 0 = hold, 1 = toggle, 2 = tap
+    int holdKey = VK_RBUTTON, requireKey = VK_LBUTTON, hotkey = 0, mode = 0; // mode 0 = hold, 1 = toggle, 2 = tap
     float vy = 300, vx = 0, jitter = 0, randMin = 15, randMax = 30, startDelay = 0, ramp = 0, smoothing = 0, duration = 0, tickHz = 500;
     float vy2 = 300, vx2 = 0, at2 = 0, vy3 = 300, vx3 = 0, at3 = 0; // stages 2/3: pull from atN ms on (0 = off)
     float growEvery = 0, growY = 0, growX = 0; // every growEvery ms held, pull gains growY/growX px/s (0 = off)
