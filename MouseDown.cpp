@@ -871,6 +871,10 @@ static void Engine(HWND hwnd) {
         if (restart) wasActive = false;
         if (active != pulling) {
             Diag(active ? "PULL ON" : "pull off");
+            if (active)
+                Diag("        %ls: %s, vertical %.0f, horizontal %.0f px/s, start delay %.0f, ramp-up %.0f, smoothing %.0f%%, "
+                     "duration %.0f ms, sensitivity %.0f%%", c.p[run].name, p.mode == 0 ? "hold" : p.mode == 1 ? "toggle" : "tap",
+                     p.vy, p.vx, p.startDelay, p.ramp, p.smoothing, p.duration, c.sens);
             movedYet = false;
             pulling = active;
             PostMessageW(hwnd, WM_APP, 0, 0);
@@ -1778,6 +1782,7 @@ static void StartDiag(bool on) {
         QueryPerformanceCounter(&diagT0);
     }
     diagOn = true;
+    Diag("build " __DATE__ " " __TIME__);
     Diag("log started: raw input %s (mouse %s, keys %s), hooks %s, running as admin: %s", rawOk ? "on" : "OFF",
          rawMouse ? "yes" : "no", rawKeys ? "yes" : "no", hooked ? "on" : "OFF", selfAdmin ? "yes" : "no");
 }
