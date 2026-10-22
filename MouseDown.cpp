@@ -562,25 +562,23 @@ static void RawSaw(int vk, bool down) {
     rawDown[vk] = down;
 }
 
-static LRESULT CALLBACK RawProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
-    RAWINPUT ri;
-    UINT sz = sizeof ri;
-    if (msg != WM_INPUT || GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) == (UINT)-1 ||
-        !ri.header.hDevice) // no device: injected
-        return DefWindowProcW(w, msg, wp, lp);
+static void HandleRaw(const RAWINPUT& ri) {
+    if (!ri.header.hDevice) return; // no device: injected
     if (ri.header.dwType == RIM_TYPEMOUSE) {
         const RAWMOUSE& m = ri.data.mouse;
         rawMouse = true;
-        bool swap = GetSystemMetrics(SM_SWAPBUTTON); // raw buttons are physical; keys are bound to logical ones
-        auto button = [&](USHORT dn, USHORT up, int vk) {
-            if (m.usButtonFlags & dn) RawSaw(vk, true);
-            if (m.usButtonFlags & up) RawSaw(vk, false);
-        };
-        button(RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, swap ? VK_RBUTTON : VK_LBUTTON);
-        button(RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, swap ? VK_LBUTTON : VK_RBUTTON);
-        button(RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, VK_MBUTTON);
-        button(RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, VK_XBUTTON1);
-        button(RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, VK_XBUTTON2);
+        if (m.usButtonFlags) { // almost every event is pure movement; only touch the button state on a real click
+            bool swap = GetSystemMetrics(SM_SWAPBUTTON); // raw buttons are physical; keys are bound to logical ones
+            auto button = [&](USHORT dn, USHORT up, int vk) {
+                if (m.usButtonFlags & dn) RawSaw(vk, true);
+                if (m.usButtonFlags & up) RawSaw(vk, false);
+            };
+            button(RI_MOUSE_LEFT_BUTTON_DOWN, RI_MOUSE_LEFT_BUTTON_UP, swap ? VK_RBUTTON : VK_LBUTTON);
+            button(RI_MOUSE_RIGHT_BUTTON_DOWN, RI_MOUSE_RIGHT_BUTTON_UP, swap ? VK_LBUTTON : VK_RBUTTON);
+            button(RI_MOUSE_MIDDLE_BUTTON_DOWN, RI_MOUSE_MIDDLE_BUTTON_UP, VK_MBUTTON);
+            button(RI_MOUSE_BUTTON_4_DOWN, RI_MOUSE_BUTTON_4_UP, VK_XBUTTON1);
+            button(RI_MOUSE_BUTTON_5_DOWN, RI_MOUSE_BUTTON_5_UP, VK_XBUTTON2);
+        }
         if (wheelShown && !hooked && !(m.usFlags & MOUSE_MOVE_ABSOLUTE)) { // without the hooks, the wheel steers from here
             wheelDX += m.lLastX;
             wheelDY += m.lLastY;
@@ -597,7 +595,26 @@ static LRESULT CALLBACK RawProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             RawSaw(vk, !(k.Flags & RI_KEY_BREAK));
         }
     }
-    return DefWindowProcW(w, msg, wp, lp);
+}
+
+// A gaming mouse floods raw input with thousands of movement events a second while a game is focused. Reading
+// them one WM_INPUT at a time lets that flood back up ahead of the button and key presses the engine waits on,
+// so the pull started seconds late. Draining the whole queue each wake with GetRawInputBuffer keeps up.
+static LRESULT CALLBACK RawProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg != WM_INPUT) return DefWindowProcW(w, msg, wp, lp);
+    alignas(8) BYTE buf[16 * 1024];
+    for (;;) {
+        UINT bytes = sizeof buf;
+        UINT n = GetRawInputBuffer((PRAWINPUT)buf, &bytes, sizeof(RAWINPUTHEADER));
+        if (n == 0 || n == (UINT)-1) break; // queue drained, or an error we retry on the next event
+        BYTE* r = buf;
+        for (UINT i = 0; i < n; i++) {
+            auto* ri = (RAWINPUT*)r;
+            HandleRaw(*ri);
+            r += (ri->header.dwSize + 7) & ~(ULONG_PTR)7; // next record, 8-byte aligned on x64
+        }
+    }
+    return 0;
 }
 
 static std::atomic<bool> rawOk;
