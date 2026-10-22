@@ -495,19 +495,11 @@ static void HookThread() {
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {}
 }
 
-static std::atomic<ULONGLONG> sentAt[256]; // when SendKey last pressed or released each key
-
-// Held = the hook saw it go down (so our own injected clicks don't count) AND Windows says it's down now.
-// Windows skips a hook that's slow to answer, so the hook alone can miss a release and leave a key stuck down.
-// A key we sent recently is the exception: our own release marks it up for Windows while the player still
-// holds it (spamming Left Mouse while Left Mouse is required), so for that one the hook decides alone.
+// From the hooks, which see real presses even when a game takes the mouse as raw input (GetAsyncKeyState
+// can lag seconds behind then) and skip our own injected clicks.
 static bool Down(int vk) {
     if (!vk) return false;
-    int async = vk;
-    if ((vk == VK_LBUTTON || vk == VK_RBUTTON) && GetSystemMetrics(SM_SWAPBUTTON))
-        async = vk == VK_LBUTTON ? VK_RBUTTON : VK_LBUTTON; // GetAsyncKeyState reads the physical buttons
-    if (!(GetAsyncKeyState(async) & 0x8000) && GetTickCount64() - sentAt[vk & 255] > 500) return false;
-    if (!hooked) return true;
+    if (!hooked) return GetAsyncKeyState(vk) & 0x8000;
     switch (vk) { // LL hooks report the left/right variants only
     case VK_SHIFT: return phys[VK_LSHIFT] || phys[VK_RSHIFT];
     case VK_CONTROL: return phys[VK_LCONTROL] || phys[VK_RCONTROL];
@@ -540,7 +532,6 @@ static void SendKey(int vk, bool down) {
         ev.ki.wScan = (WORD)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
         ev.ki.dwFlags = KEYEVENTF_SCANCODE | (Extended(vk) ? KEYEVENTF_EXTENDEDKEY : 0) | (down ? 0 : KEYEVENTF_KEYUP);
     }
-    sentAt[vk & 255] = GetTickCount64();
     SendInput(1, &ev, sizeof ev);
 }
 
