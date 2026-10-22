@@ -58,7 +58,7 @@ struct Config {
     int swapKey = 0;          // flips the active group between its two slots
     bool scrollSwap = false;  // each mouse wheel notch flips the active group's slot (the game still gets the scroll)
     bool slotReset = false;   // switching to a group starts it in slot 1, not where it was left
-    bool listGroups = false;  // the profile list shows only groups (and whatever is active)
+    int listShow = 0;         // profile list: 0 everything, 1 only normal profiles, 2 only groups
     bool switchGroups = false; // wheel, quick switch and next/prev move between groups only
     bool sound = false; // beep on on/off and profile switches
     int accent = 0; // UI colour, index into accents[]
@@ -144,6 +144,15 @@ static int SwitchTargets(const Config& c, int* out) {
     return m;
 }
 
+// The profile list's rows, in list order: everything, only normal profiles or only groups. The active
+// profile always shows, so the one being edited never disappears. Returns how many.
+static int VisibleProfiles(const Config& c, int* out) {
+    int m = 0;
+    for (int i = 0; i < c.n; i++)
+        if (c.listShow == 0 || (c.listShow == 1) != c.p[i].group || i == c.cur) out[m++] = i;
+    return m;
+}
+
 // The target `step` places on from profile `from`, wrapping. From one that isn't a target, +1 is the first.
 static int StepTarget(const Config& c, int from, int step) {
     int t[MAX_PROFILES], m = SwitchTargets(c, t), pos = -1;
@@ -216,7 +225,7 @@ static void LoadSettings() {
     cfg.swapKey = (int)get(L"general", L"swapKey", cfg.swapKey, 0, 254);
     cfg.scrollSwap = get(L"general", L"scrollSwap", 0, 0, 1) != 0;
     cfg.slotReset = get(L"general", L"slotReset", 0, 0, 1) != 0;
-    cfg.listGroups = get(L"general", L"listGroups", 0, 0, 1) != 0;
+    cfg.listShow = (int)get(L"general", L"listShow", get(L"general", L"listGroups", 0, 0, 1) ? 2 : 0, 0, 2);
     cfg.switchGroups = get(L"general", L"switchGroups", 0, 0, 1) != 0;
     GetPrivateProfileStringW(L"general", L"port", L"", cfg.port, 16, ini);
     for (int i = 0; i < cfg.n; i++) {
@@ -237,7 +246,7 @@ static void LoadSettings() {
         p.childSel = (int)get(sec, L"slot", 0, 0, 1);
         // auto spam used to be one setting for all profiles: a profile without its own starts from that
         auto spam = [&](const wchar_t* k, double def, double lo, double hi) { return get(sec, k, get(L"general", k, def, lo, hi), lo, hi); };
-        p.spamOn = spam(L"spamOn", 0, 0, 1) != 0;
+        p.spamOn = get(sec, L"spamOn", 0, 0, 1) != 0; // off unless this profile turned it on
         p.spamPull = spam(L"spamPull", 0, 0, 1) != 0;
         p.spamDelayOff = spam(L"spamDelayOff", 0, 0, 1) != 0;
         p.spamTrigger = (int)spam(L"spamTrigger", 0, 0, 254);
@@ -286,7 +295,7 @@ static void Save() {
     put(L"swapKey", c.swapKey);
     put(L"scrollSwap", c.scrollSwap);
     put(L"slotReset", c.slotReset);
-    put(L"listGroups", c.listGroups);
+    put(L"listShow", c.listShow);
     put(L"switchGroups", c.switchGroups);
     str(L"port", c.port);
     for (int i = 0; i < c.n; i++) {
@@ -915,7 +924,7 @@ static const UINT32 accents[ACCENTS][2] = { // accent, soft tint for text on it
 };
 static UINT32 ACCENT = accents[0][0], ACCENT_SOFT = accents[0][1]; // set from cfg.accent each frame
 const float WIN_W = 1260, WIN_H = 830, HEADER = 56;
-const D2D1_RECT_F PILL = {132, 17, 216, 39}, UPDATE_BTN = {WIN_W - 236, 13, WIN_W - 108, 43}, TABS = {236, 13, 434, 43};
+const D2D1_RECT_F PILL = {132, 17, 216, 39}, UPDATE_BTN = {WIN_W - 236, 13, WIN_W - 108, 43}, TABS = {236, 13, 530, 43};
 
 static HWND hwnd;
 static ID2D1Factory* d2d;
@@ -1409,6 +1418,28 @@ static void ProfilePick(int& idx, D2D1_RECT_F b, bool active) {
     Text(L"›", R(b.right - 15, b.top, 10, 32), fValue, MUTED);
 }
 
+// One line about a profile for the list: its pull and keys, or a group's slots (● = active) and their keys.
+static std::wstring Details(const Config& c, int i) {
+    const Profile& p = c.p[i];
+    std::wstring s;
+    if (p.group) {
+        for (int k = 0; k < 2; k++) {
+            int ch = SlotProfile(c, p, k);
+            s += k ? L"        " : L"";
+            s += p.childSel == k ? L"●  " : L"○  ";
+            s += ch >= 0 ? (*c.p[ch].name ? c.p[ch].name : L"Untitled") : L"empty";
+            if (p.childKey[k]) s += L"  [" + KeyName(p.childKey[k]) + L"]";
+        }
+        return s;
+    }
+    static const wchar_t* const modes[] = {L"Hold", L"Toggle", L"Tap"};
+    wchar_t b[96];
+    swprintf_s(b, L"↓%.0f  →%.0f px/s     ·     %s ", p.vy, p.vx, modes[p.mode]);
+    s = b + KeyName(p.holdKey);
+    if (p.spamOn) s += L"     ·     spam " + KeyName(p.spamKey);
+    return s;
+}
+
 static void RunProfileCmd() {
     Profile* p = cfg.p;
     int& n = cfg.n;
@@ -1490,142 +1521,139 @@ static void Frame(float W) {
     Line(W - 38, 23, W - 28, 33, TEXT, 1.2f);
     Line(W - 38, 33, W - 28, 23, TEXT, 1.2f);
 
-    static int tab; // 0 = profiles, 1 = settings
+    static int tab = 1; // 0 = the profile list, 1 = edit the selected one, 2 = settings
+    static const wchar_t* const tabNames[] = {L"Profiles", L"Edit", L"Settings"};
     Fill(TABS, 8, BTN);
     Stroke(TABS, 8, BORDER);
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < 3; k++) {
         D2D1_RECT_F t = R(TABS.left + 3 + k * 96.f, TABS.top + 3, 96, TABS.bottom - TABS.top - 6);
         if (Button(t) && tab != k) {
             tab = k;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         if (tab == k) Fill(t, 6, ACCENT);
-        Text(k ? L"Settings" : L"Profiles", t, fValue, tab == k ? WHITE : In(t) ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+        Text(tabNames[k], t, fValue, tab == k ? WHITE : In(t) ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
     // the profile list scrolls inside its card and follows the current profile when it changes elsewhere
     static float scroll;
     static int shownCur = -1, dragRow = -1; // dragRow: profile being dragged to a new place in the list
     static const wchar_t* const scopes[] = {L"All", L"Groups"};
+    static const wchar_t* const shows[] = {L"All", L"Profiles", L"Groups"};
+    int vis[MAX_PROFILES], nv = VisibleProfiles(cfg, vis), curRow = 0;
+    for (int v = 0; v < nv; v++)
+        if (vis[v] == cfg.cur) curRow = v;
     if (tab == 0) {
-        // sidebar: every profile, or just the groups (plus the active one so it's never hidden)
-        int vis[MAX_PROFILES], nv = 0, tgt[MAX_PROFILES], nt = SwitchTargets(cfg, tgt), num[MAX_PROFILES], curRow = 0;
+        int tgt[MAX_PROFILES], nt = SwitchTargets(cfg, tgt), num[MAX_PROFILES];
         std::fill(num, num + cfg.n, -1); // quick switch number of each profile, if it has one
         for (int k = 0; k < nt; k++) num[tgt[k]] = k;
-        for (int i = 0; i < cfg.n; i++)
-            if (!cfg.listGroups || cfg.p[i].group || i == cfg.cur) {
-                if (i == cfg.cur) curRow = nv;
-                vis[nv++] = i;
-            }
-        const D2D1_RECT_F list = R(24, 98, 172, 708);
-        const float listH = list.bottom - list.top - 8, maxScroll = std::max(0.f, (nv + 1) * 38.f - 4 - listH);
+
+        // bar: list commands and what the list shows
+        if (TextButton(L"+  Profile", R(20, 64, 110, 34), cfg.n < MAX_PROFILES)) profileCmd = 1;
+        if (TextButton(L"+  Group", R(138, 64, 110, 34), cfg.n < MAX_PROFILES)) profileCmd = 6;
+        if (TextButton(L"Duplicate", R(256, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
+        if (TextButton(L"Delete", R(364, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
+        if (TextButton(L"Copy", R(456, 64, 72, 34))) profileCmd = 4;
+        if (TextButton(L"Paste", R(536, 64, 72, 34))) profileCmd = 5;
+        Segment(L"Show", cfg.listShow, shows, 900, 65, 340, 80);
+
+        Card(20, 116, 1220, 696, L"PROFILES", L"click to select  ·  double-click to edit  ·  drag to reorder");
+        static const std::pair<const wchar_t*, float> heads[] = {{L"#", 40}, {L"Name", 68}, {L"Type", 298}, {L"Details", 378}};
+        for (auto& [label, x] : heads) Text(label, R(x, 148, 200, 18), fSmall, DISABLED);
+        Text(L"Hotkey", R(1082, 148, 140, 18), fSmall, DISABLED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        const D2D1_RECT_F list = R(24, 168, 1212, 640);
+        const float listH = list.bottom - list.top - 8, maxScroll = std::max(0.f, nv * 38.f - 4 - listH);
         if (In(list) && in.wheel) scroll -= in.wheel * 38;
         if (cfg.cur != shownCur) {
             shownCur = cfg.cur;
             scroll = std::clamp(scroll, curRow * 38.f + 34 - listH, curRow * 38.f);
         }
         scroll = std::clamp(scroll, 0.f, maxScroll);
-        Card(20, 64, 180, 748, L"PROFILES");
-        for (int k = 0; k < 2; k++) { // All | Groups
-            D2D1_RECT_F b = R(104 + k * 44.f, 73, 44, 20);
-            bool on = cfg.listGroups == (k == 1);
-            if (Button(b)) {
-                cfg.listGroups = k == 1;
-                saveReq = true;
-            }
-            if (on || In(b)) Fill(b, 6, on ? BTN_HOVER : BTN);
-            Text(scopes[k], b, fSmall, on ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
-        }
         rt->PushAxisAlignedClip(list, D2D1_ANTIALIAS_MODE_ALIASED);
         for (int v = 0; v < nv; v++) {
             int i = vis[v];
-            D2D1_RECT_F r = R(28, 102 + v * 38.f - scroll, 164, 34);
+            const Profile& q = cfg.p[i];
+            D2D1_RECT_F r = R(28, 172 + v * 38.f - scroll, 1204, 34);
             if (r.bottom < list.top || r.top > list.bottom) continue;
             bool sel = cfg.cur == i, hover = In(r) && In(list);
             if (hover && Button(r)) {
                 cfg.cur = i;
-                if (!cfg.listGroups) dragRow = i; // reordering works on the full list only
+                if (in.dbl) tab = 1, dragRow = -1; // double-click: open it
+                else if (cfg.listShow == 0) dragRow = i; // reordering works on the full list only
                 saveReq = true;
             }
             Fill(r, 8, sel ? ACCENT : hover || dragRow == i ? BTN_HOVER : CARD);
             if (num[i] >= 0 && num[i] < 9)
-                Text(std::to_wstring(num[i] + 1).c_str(), R(r.left + 10, r.top, 14, 34), fSmall, sel ? ACCENT_SOFT : DISABLED);
-            int hk = cfg.p[i].hotkey;
-            Text(*cfg.p[i].name ? cfg.p[i].name : L"Untitled", R(r.left + 26, r.top, hk || cfg.p[i].group ? 74.f : 126.f, 34),
-                 fLabel, sel ? WHITE : TEXT);
-            int ch = cfg.p[i].group ? SlotProfile(cfg, cfg.p[i], cfg.p[i].childSel) : -1;
-            std::wstring tail = hk ? KeyName(hk) : cfg.p[i].group ? L"› " + std::wstring(ch >= 0 ? cfg.p[ch].name : L"None") : L"";
-            if (!tail.empty())
-                Text(tail.c_str(), R(r.right - 64, r.top, 54, 34), fSmall, sel ? ACCENT_SOFT : MUTED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+                Text(std::to_wstring(num[i] + 1).c_str(), R(40, r.top, 20, 34), fSmall, sel ? ACCENT_SOFT : DISABLED);
+            Text(*q.name ? q.name : L"Untitled", R(68, r.top, 220, 34), fLabel, sel ? WHITE : TEXT);
+            Text(q.group ? L"Group" : L"Profile", R(298, r.top, 70, 34), fSmall, sel ? ACCENT_SOFT : q.group ? ACCENT : MUTED);
+            Text(Details(cfg, i).c_str(), R(378, r.top, 690, 34), fSmall, sel ? ACCENT_SOFT : MUTED);
+            if (q.hotkey) Text(KeyName(q.hotkey).c_str(), R(r.right - 150, r.top, 138, 34), fSmall, sel ? ACCENT_SOFT : MUTED,
+                               DWRITE_TEXT_ALIGNMENT_TRAILING);
         }
-        if (cfg.n < MAX_PROFILES) {
-            float top = 102 + nv * 38.f - scroll;
-            for (int k = 0; k < 2; k++) { // + Profile | + Group
-                D2D1_RECT_F b = R(28 + k * 84.f, top, 80, 34);
-                bool hover = In(b) && In(list);
-                if (hover && Button(b)) profileCmd = k ? 6 : 1;
-                if (hover) Fill(b, 8, BTN_HOVER);
-                Stroke(b, 8, BORDER);
-                Text(k ? L"+  Group" : L"+  Profile", b, fValue, hover ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
-            }
-        }
+        if (!nv) Text(L"Nothing to show here: pick All or make one", R(40, 180, 600, 34), fLabel, MUTED);
         rt->PopAxisAlignedClip();
         if (maxScroll > 0) { // scrollbar
             float th = listH * listH / (listH + maxScroll), ty = list.top + 4 + (listH - th) * scroll / maxScroll;
-            Fill(R(193, ty, 3, th), 1.5f, MUTED, .5f);
+            Fill(R(1233, ty, 3, th), 1.5f, MUTED, .5f);
         }
-
-        // profile bar
-        NameField(g.name, NAME_LEN, R(220, 64, 250, 34), L"Untitled", L"Rename");
-        if (TextButton(L"Duplicate", R(480, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
-        if (TextButton(L"Delete", R(588, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
-        if (TextButton(L"Copy", R(680, 64, 72, 34))) profileCmd = 4;
-        if (TextButton(L"Paste", R(760, 64, 72, 34))) profileCmd = 5;
-        Text(L"Scroll: fine steps · click value: type · right-click: reset", R(840, 64, W - 860, 34), fSmall, MUTED,
+    } else if (tab == 1) {
+        // bar: step through the list without leaving the page, rename, list commands
+        for (int k = 0; k < 2; k++)
+            if (TextButton(k ? L"›" : L"‹", R(20 + k * 38.f, 64, 34, 34), nv > 1)) {
+                cfg.cur = vis[(curRow + (k ? 1 : nv - 1)) % nv];
+                saveReq = true;
+            }
+        NameField(g.name, NAME_LEN, R(100, 64, 250, 34), L"Untitled", L"Rename");
+        if (TextButton(L"Duplicate", R(360, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
+        if (TextButton(L"Delete", R(468, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
+        if (TextButton(L"Copy", R(560, 64, 72, 34))) profileCmd = 4;
+        if (TextButton(L"Paste", R(640, 64, 72, 34))) profileCmd = 5;
+        Text(L"Scroll: fine steps · click value: type · right-click: reset", R(720, 64, W - 740, 34), fSmall, MUTED,
              DWRITE_TEXT_ALIGNMENT_TRAILING);
 
-        // middle column: keys (or the group's slots), then auto spam
+        // left column: keys (or the group's slots), then auto spam
         if (g.group) { // slots: click the label to make it active; ‹ › picks the profile; then the slot's key
-            Card(220, 116, 300, 220, L"GROUP", L"Backspace clears");
+            Card(20, 116, 360, 220, L"GROUP", L"Backspace clears");
             for (int k = 0; k < 2; k++) {
                 float y = 152 + k * 44.f;
                 bool act = g.childSel == k;
-                if (Button(R(236, y, 54, 32))) {
+                if (Button(R(36, y, 54, 32))) {
                     g.childSel = k;
                     saveReq = true;
                 }
-                if (act) Circle(240, y + 16, 3.5f, GREEN);
-                Text(k ? L"Slot 2" : L"Slot 1", R(248, y, 46, 32), fLabel, act ? TEXT : MUTED);
-                ProfilePick(g.child[k], R(294, y, 114, 32), act);
-                KeyBind(L"", g.childKey[k], 414, y, 90, 90);
+                if (act) Circle(40, y + 16, 3.5f, GREEN);
+                Text(k ? L"Slot 2" : L"Slot 1", R(48, y, 46, 32), fLabel, act ? TEXT : MUTED);
+                ProfilePick(g.child[k], R(94, y, 150, 32), act);
+                KeyBind(L"", g.childKey[k], 250, y, 114, 114);
             }
-            Text(L"Slot keys switch only while this group is active", R(236, 240, 268, 18), fSmall, MUTED);
-            Text(L"and still reach the game (bind your weapon keys)", R(236, 258, 268, 18), fSmall, MUTED);
+            Text(L"Slot keys switch only while this group is active", R(36, 240, 328, 18), fSmall, MUTED);
+            Text(L"and still reach the game (bind your weapon keys)", R(36, 258, 328, 18), fSmall, MUTED);
         } else {
-            Card(220, 116, 300, 220, L"KEYS", L"Backspace clears");
-            KeyBind(L"Hold to pull", p.holdKey, 236, 152, 268);
-            KeyBind(L"Also require", p.requireKey, 236, 196, 268);
+            Card(20, 116, 360, 220, L"KEYS", L"Backspace clears");
+            KeyBind(L"Hold to pull", p.holdKey, 36, 152, 328);
+            KeyBind(L"Also require", p.requireKey, 36, 196, 328);
             static const wchar_t* const modes[] = {L"Hold", L"Toggle", L"Tap"};
-            Segment(L"Activation", p.mode, modes, 236, 240, 268);
+            Segment(L"Activation", p.mode, modes, 36, 240, 328);
         }
-        KeyBind(L"Profile hotkey", g.hotkey, 236, 284, 268);
+        KeyBind(L"Profile hotkey", g.hotkey, 36, 284, 328);
 
         wchar_t spamTitle[48] = L"AUTO SPAM";
         if (g.group && runIdx >= 0) swprintf_s(spamTitle, L"AUTO SPAM  ·  %s", *p.name ? p.name : L"Untitled");
-        Card(220, 348, 300, 464, spamTitle);
+        Card(20, 348, 360, 464, spamTitle);
         if (runIdx >= 0) {
-            Toggle(L"Enabled", p.spamOn, 236, 384, 268);
-            KeyBind(L"Hold to spam", p.spamTrigger, 236, 428, 268);
-            KeyBind(L"Also require", p.spamRequire, 236, 472, 268);
-            KeyBind(L"Key to spam", p.spamKey, 236, 516, 268);
-            Slider(spamDefs[0], p.spamRate, 236, 562, 126);
-            Slider(spamDefs[1], p.spamDelay, 378, 562, 126, &p.spamDelayOff);
-            Toggle(L"Clicks trigger pull", p.spamPull, 236, 612, 268);
-            Slider(spamDefs[2], p.spamJitter, 236, 658, 268);
+            Toggle(L"Enabled", p.spamOn, 36, 384, 328);
+            KeyBind(L"Hold to spam", p.spamTrigger, 36, 428, 328);
+            KeyBind(L"Also require", p.spamRequire, 36, 472, 328);
+            KeyBind(L"Key to spam", p.spamKey, 36, 516, 328);
+            Slider(spamDefs[0], p.spamRate, 36, 562, 156);
+            Slider(spamDefs[1], p.spamDelay, 208, 562, 156, &p.spamDelayOff);
+            Toggle(L"Clicks trigger pull", p.spamPull, 36, 612, 328);
+            Slider(spamDefs[2], p.spamJitter, 36, 658, 328);
         }
 
-        // pull, then timing + curve on the right
-        Card(940, 424, 300, 388, L"CURVE");
+        // pull in the middle, timing + curve on the right
+        Card(840, 424, 400, 388, L"CURVE");
         Circle(1190, 445, 3.5f, ACCENT);
         Text(L"y", R(1196, 436, 12, 18), fSmall, MUTED);
         Circle(1210, 445, 3.5f, TEAL);
@@ -1636,9 +1664,9 @@ static void Frame(float W) {
             static const wchar_t* const stages[] = {L"1", L"2", L"3"};
             wchar_t pullTitle[48] = L"PULL";
             if (g.group) swprintf_s(pullTitle, L"PULL  ·  %s", *p.name ? p.name : L"Untitled"); // editing the active slot's profile
-            Card(540, 116, 380, 696, pullTitle);
-            Segment(L"Spray stage", stage, stages, 556, 152, 348);
-            const float segL = 556 + 348 - std::size(stages) * 58.f - 3; // left edge of the first tab
+            Card(400, 116, 420, 696, pullTitle);
+            Segment(L"Spray stage", stage, stages, 416, 152, 388);
+            const float segL = 416 + 388 - std::size(stages) * 58.f - 3; // left edge of the first tab
             for (int s = 1; s < 3; s++) { // green dot over stages that are on
                 float at = s == 1 ? (p.off[6] ? 0 : p.at2) : (p.off[7] ? 0 : p.at3);
                 if (at > 0) Circle(segL + s * 58 + 50, 158, 3, GREEN);
@@ -1647,28 +1675,28 @@ static void Frame(float W) {
                 Slider(d, p.*d.f, x, y, w, d.bit >= 0 ? &p.off[d.bit] : nullptr);
             };
             int base = stage ? 2 + (stage - 1) * 3 : 0;
-            PS(fields[base], 556, 196, 348);
-            PS(fields[base + 1], 556, 246, 348);
-            if (stage) PS(fields[base + 2], 556, 296, 348);
-            else Text(L"Runs from activation until stage 2 / 3 starts", R(556, 296, 348, 40), fSmall, MUTED);
-            PS(fields[STAGE_FIELDS], 556, 346, 348); // jitter
-            PS(fields[STAGE_FIELDS + 1], 556, 396, 164); // offset min/max: both switches flip the same flag
-            PS(fields[STAGE_FIELDS + 2], 740, 396, 164);
-            PS(swayDefs[0], 556, 452, 164); // sway amplitude (its switch) + period
-            PS(swayDefs[1], 740, 452, 164);
-            Line(556, 512, 904, 512, BORDER);
-            Text(L"GROWTH", R(556, 524, 200, 18), fSection, MUTED);
-            Text(L"pull gained every step while held", R(556, 524, 348, 18), fSmall, DISABLED, DWRITE_TEXT_ALIGNMENT_TRAILING);
-            for (int i = 0; i < 3; i++) PS(growDefs[i], 556, 556 + i * 50.f, 348);
+            PS(fields[base], 416, 196, 388);
+            PS(fields[base + 1], 416, 246, 388);
+            if (stage) PS(fields[base + 2], 416, 296, 388);
+            else Text(L"Runs from activation until stage 2 / 3 starts", R(416, 296, 388, 40), fSmall, MUTED);
+            PS(fields[STAGE_FIELDS], 416, 346, 388); // jitter
+            PS(fields[STAGE_FIELDS + 1], 416, 396, 184); // offset min/max: both switches flip the same flag
+            PS(fields[STAGE_FIELDS + 2], 620, 396, 184);
+            PS(swayDefs[0], 416, 452, 184); // sway amplitude (its switch) + period
+            PS(swayDefs[1], 620, 452, 184);
+            Line(416, 512, 804, 512, BORDER);
+            Text(L"GROWTH", R(416, 524, 200, 18), fSection, MUTED);
+            Text(L"pull gained every step while held", R(416, 524, 388, 18), fSmall, DISABLED, DWRITE_TEXT_ALIGNMENT_TRAILING);
+            for (int i = 0; i < 3; i++) PS(growDefs[i], 416, 556 + i * 50.f, 388);
 
-            Card(940, 116, 300, 296, L"TIMING & SMOOTHING");
+            Card(840, 116, 400, 296, L"TIMING & SMOOTHING");
             for (int i = PULL_FIELDS; i < (int)std::size(fields); i++)
-                PS(fields[i], 956, 152 + (i - PULL_FIELDS) * 50.f, 268);
-            Preview(Effective(p), cfg.sens / 100, 956, 464, 268, 270);
+                PS(fields[i], 856, 152 + (i - PULL_FIELDS) * 50.f, 368);
+            Preview(Effective(p), cfg.sens / 100, 856, 464, 368, 270);
         } else {
-            Card(540, 116, 380, 696, L"PULL");
-            Text(L"This slot is empty: pick a profile for it in the Group card", R(556, 152, 348, 32), fLabel, MUTED);
-            Card(940, 116, 300, 296, L"TIMING & SMOOTHING");
+            Card(400, 116, 420, 696, L"PULL");
+            Text(L"This slot is empty: pick a profile for it in the Group card", R(416, 152, 388, 32), fLabel, MUTED);
+            Card(840, 116, 400, 296, L"TIMING & SMOOTHING");
         }
     } else {
         Card(20, 64, 380, 460, L"GENERAL");
@@ -1701,10 +1729,10 @@ static void Frame(float W) {
         KeyBind(L"Last profile", cfg.lastKey, 436, 188, 348);
         KeyBind(L"Quick switch", cfg.quickKey, 436, 232, 348);
         KeyBind(L"Hold for wheel", cfg.wheelKey, 436, 276, 348);
-        int sg = cfg.switchGroups, lg = cfg.listGroups;
+        int sg = cfg.switchGroups;
         Segment(L"Wheel, 1–9 and next / prev use", sg, scopes, 436, 322, 348, 66);
-        Segment(L"Profile list shows", lg, scopes, 436, 366, 348, 66);
-        cfg.switchGroups = sg, cfg.listGroups = lg;
+        Segment(L"Profile list shows", cfg.listShow, shows, 436, 366, 348, 66);
+        cfg.switchGroups = sg;
         Text(L"Quick switch: hold it and press 1–9, or scroll", R(436, 414, 348, 18), fSmall, MUTED);
         Text(L"Wheel: aim, scroll or click to pick", R(436, 432, 348, 18), fSmall, MUTED);
         Text(L"Groups: normal profiles are skipped (the list still", R(436, 450, 348, 18), fSmall, MUTED);
@@ -1721,7 +1749,7 @@ static void Frame(float W) {
         Text(L"Mouse wheel swaps on every notch and still scrolls in the", R(836, 254, 388, 18), fSmall, MUTED);
         Text(L"game, so it follows games that change weapons with it.", R(836, 272, 388, 18), fSmall, MUTED);
         Text(L"Each group's own slot keys also still reach the game.", R(836, 290, 388, 18), fSmall, MUTED);
-        Text(L"Make groups with  + Group  under the profile list.", R(836, 326, 388, 18), fSmall, MUTED);
+        Text(L"Make groups with  + Group  on the Profiles tab.", R(836, 326, 388, 18), fSmall, MUTED);
     }
 
     if (numTarget && !numSeen) { // its slider is gone (profile or stage switched): drop the edit
@@ -1735,7 +1763,7 @@ static void Frame(float W) {
         if (!in.down || dragRow >= cfg.n) {
             dragRow = -1;
         } else {
-            int to = std::clamp((int)std::floor((in.my - 102 + scroll) / 38), 0, cfg.n - 1);
+            int to = std::clamp((int)std::floor((in.my - 172 + scroll) / 38), 0, cfg.n - 1);
             if (to != dragRow) cursor = IDC_SIZENS;
             for (; dragRow < to; dragRow++) SwapProfiles(cfg, dragRow, dragRow + 1);
             for (; dragRow > to; dragRow--) SwapProfiles(cfg, dragRow, dragRow - 1);

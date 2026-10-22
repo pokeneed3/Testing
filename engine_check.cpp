@@ -104,6 +104,16 @@ int main() {
     gc.p[0].group = gc.p[2].group = false;
     assert(SwitchTargets(gc, tg) == 3);
 
+    // The list shows everything, only profiles or only groups; the active one always shows
+    gc.p[1].group = true, gc.cur = 0;
+    int vg[MAX_PROFILES];
+    gc.listShow = 0;
+    assert(VisibleProfiles(gc, vg) == 3);
+    gc.listShow = 1;
+    assert(VisibleProfiles(gc, vg) == 2 && vg[0] == 0 && vg[1] == 2);
+    gc.listShow = 2;
+    assert(VisibleProfiles(gc, vg) == 2 && vg[0] == 0 && vg[1] == 1); // 0 is a profile, but it's the active one
+
     // Settings survive a save and load, non-ASCII names and deleted profiles included
     GetTempPathW(MAX_PATH, ini);
     wcscat_s(ini, L"engine_check.ini");
@@ -130,11 +140,14 @@ int main() {
     // Auto spam saved before it was per profile: a profile without its own starts from the old shared setting
     WritePrivateProfileStringW(L"general", L"spamKey", L"1", ini);
     WritePrivateProfileStringW(L"general", L"spamRate", L"25", ini);
+    WritePrivateProfileStringW(L"general", L"spamOn", L"1", ini);
+    WritePrivateProfileStringW(L"profile1", L"spamOn", nullptr, ini);
     WritePrivateProfileStringW(L"profile1", L"spamKey", nullptr, ini);
     WritePrivateProfileStringW(L"profile1", L"spamRate", nullptr, ini);
     cfg = Config{};
     LoadSettings();
     assert(cfg.p[0].spamKey == VK_LBUTTON && cfg.p[0].spamRate == 25 && cfg.p[1].spamRate == 10);
+    assert(!cfg.p[0].spamOn); // but spam itself starts off
     DeleteFileW(ini);
     puts("engine ok");
 }
