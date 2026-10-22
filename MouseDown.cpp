@@ -5,6 +5,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <winhttp.h>
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
@@ -23,6 +24,7 @@
 #pragma comment(lib, "dwrite")
 #pragma comment(lib, "dwmapi")
 #pragma comment(lib, "winmm")
+#pragma comment(lib, "winhttp")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
 // ---------- settings ----------
@@ -636,6 +638,130 @@ static void Engine(HWND hwnd) {
     }
 }
 
+// ---------- updates ----------
+
+// The app updates itself from the repo's main branch. Files it downloads and writes itself carry no
+// "downloaded from the internet" mark, so new versions don't need unblocking the way a browser download does.
+#define UPDATE_REPO L"pokeneed3/Testing"
+static const wchar_t* const updateFiles[] = {L"MouseDown.cpp", L"engine_check.cpp", L"mouse_hid.ino"}; // besides the exe
+enum { UPD_IDLE, UPD_CHECKING, UPD_LATEST, UPD_READY, UPD_INSTALLING, UPD_FAILED };
+static std::atomic<int> updState;
+static std::string updExe;  // the newer exe, once updState is UPD_READY
+static std::wstring updSha; // the commit it came from
+
+static bool HttpGetVia(DWORD access, const wchar_t* host, const std::wstring& path, std::string& out) {
+    out.clear();
+    HINTERNET s = WinHttpOpen(L"MouseDown-updater", access, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET c = s ? WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0) : nullptr;
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         WINHTTP_FLAG_SECURE) : nullptr;
+    DWORD status = 0, sz = sizeof status, got;
+    bool ok = r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+              WinHttpReceiveResponse(r, nullptr) &&
+              WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+                                  &status, &sz, WINHTTP_NO_HEADER_INDEX) && status == 200;
+    char buf[16384];
+    while (ok && (ok = WinHttpReadData(r, buf, sizeof buf, &got) != FALSE) && got) out.append(buf, got); // 0 bytes = done
+    ok = ok && !out.empty();
+    for (HINTERNET h : {r, c, s}) if (h) WinHttpCloseHandle(h);
+    return ok;
+}
+
+// HTTPS GET into out: the system's automatic proxy setup first, then the plain WinHTTP proxy setting.
+static bool HttpGet(const wchar_t* host, const std::wstring& path, std::string& out) {
+    return HttpGetVia(4 /*WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY*/, host, path, out) ||
+           HttpGetVia(WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, host, path, out);
+}
+
+static std::wstring SelfPath() {
+    wchar_t p[MAX_PATH];
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    return p;
+}
+
+static bool ReadAll(const std::wstring& path, std::string& out) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER n;
+    DWORD got = 0;
+    bool ok = GetFileSizeEx(h, &n) && n.QuadPart < (1 << 30);
+    if (ok) {
+        out.resize((size_t)n.QuadPart);
+        ok = ReadFile(h, out.data(), (DWORD)out.size(), &got, nullptr) && got == out.size();
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+static bool WriteAll(const std::wstring& path, const std::string& data) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD wr;
+    bool ok = WriteFile(h, data.data(), (DWORD)data.size(), &wr, nullptr) && wr == data.size();
+    CloseHandle(h);
+    return ok;
+}
+
+// Worker thread: find main's latest commit and fetch the exe from exactly that commit (raw.githubusercontent
+// caches a branch's files for minutes, a commit's never go stale). Newer = differs from the running exe.
+static bool FindUpdate() {
+    updState = UPD_CHECKING;
+    std::string api, exe, self;
+    size_t at;
+    if (!HttpGet(L"api.github.com", L"/repos/" UPDATE_REPO L"/commits/main", api) ||
+        (at = api.find("\"sha\":\"")) == std::string::npos || api.size() < at + 47) {
+        updState = UPD_FAILED;
+        return false;
+    }
+    std::wstring sha(api.begin() + at + 7, api.begin() + at + 47);
+    if (!HttpGet(L"raw.githubusercontent.com", L"/" UPDATE_REPO L"/" + sha + L"/MouseDown.exe", exe) || exe.size() < 4096 ||
+        exe[0] != 'M' || exe[1] != 'Z') {
+        updState = UPD_FAILED;
+        return false;
+    }
+    if (ReadAll(SelfPath(), self) && self == exe) {
+        updState = UPD_LATEST;
+        return false;
+    }
+    updExe = std::move(exe);
+    updSha = sha;
+    updState = UPD_READY;
+    return true;
+}
+
+// Worker thread: put the new files in place, then ask the UI to save and restart. A running exe can't be
+// overwritten but can be renamed, so it moves aside to .old (deleted by the next start). settings.ini is never touched.
+static void InstallUpdate(HWND w) {
+    updState = UPD_INSTALLING;
+    std::wstring self = SelfPath(), dir = self.substr(0, self.rfind(L'\\') + 1);
+    std::string data;
+    for (const wchar_t* f : updateFiles) // sources are a convenience: a missing one doesn't stop the update
+        if (HttpGet(L"raw.githubusercontent.com", L"/" UPDATE_REPO L"/" + updSha + L"/" + f, data)) WriteAll(dir + f, data);
+    std::wstring fresh = self + L".new", old = self + L".old";
+    bool ok = WriteAll(fresh, updExe) && MoveFileExW(self.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING);
+    if (ok && !MoveFileExW(fresh.c_str(), self.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old.c_str(), self.c_str(), MOVEFILE_REPLACE_EXISTING); // put the running one back
+        ok = false;
+    }
+    DeleteFileW(fresh.c_str());
+    if (!ok) {
+        updState = UPD_FAILED;
+        return;
+    }
+    PostMessageW(w, WM_APP + 2, 0, 0);
+}
+
+// Update button: install what a check already found, otherwise check and install if there is something newer.
+static void StartUpdate(HWND w) {
+    int st = updState;
+    if (st == UPD_CHECKING || st == UPD_INSTALLING) return;
+    updState = UPD_CHECKING; // shows at once, and a second click can't start another
+    std::thread([w, st] {
+        if (st == UPD_READY || FindUpdate()) InstallUpdate(w);
+        PostMessageW(w, WM_APP, 0, 0);
+    }).detach();
+}
+
 // ---------- UI ----------
 
 enum : UINT32 {
@@ -648,7 +774,7 @@ static const UINT32 accents[ACCENTS][2] = { // accent, soft tint for text on it
 };
 static UINT32 ACCENT = accents[0][0], ACCENT_SOFT = accents[0][1]; // set from cfg.accent each frame
 const float WIN_W = 1260, WIN_H = 830, HEADER = 56;
-const D2D1_RECT_F PILL = {132, 17, 216, 39};
+const D2D1_RECT_F PILL = {132, 17, 216, 39}, UPDATE_BTN = {WIN_W - 236, 13, WIN_W - 108, 43};
 
 static HWND hwnd;
 static ID2D1Factory* d2d;
@@ -1164,6 +1290,15 @@ static void Frame(float W) {
     Circle(PILL.left + 13, PILL.top + 11, 3.5f, sc);
     Text(!cfg.enabled ? L"OFF" : paused ? L"PAUSED" : pull ? L"PULLING" : L"READY", R(PILL.left + 23, PILL.top, 60, 22), fPill, sc);
 
+    int upd = updState;
+    static const wchar_t* const updLabels[] = {L"Update", L"Checking…", L"Up to date", L"Install update", L"Updating…", L"Update failed"};
+    bool updBusy = upd == UPD_CHECKING || upd == UPD_INSTALLING;
+    if (Button(UPDATE_BTN) && !updBusy) StartUpdate(hwnd);
+    Fill(UPDATE_BTN, 8, upd == UPD_READY ? ACCENT : In(UPDATE_BTN) && !updBusy ? BTN_HOVER : BTN);
+    Stroke(UPDATE_BTN, 8, upd == UPD_READY ? ACCENT : BORDER);
+    Text(updLabels[upd], UPDATE_BTN, fValue, upd == UPD_READY ? WHITE : upd == UPD_FAILED ? RED : updBusy ? MUTED : TEXT,
+         DWRITE_TEXT_ALIGNMENT_CENTER);
+
     D2D1_RECT_F minB = R(W - 96, 10, 38, 36), closeB = R(W - 52, 10, 38, 36);
     if (In(minB)) Fill(minB, 8, BTN_HOVER);
     if (In(closeB)) Fill(closeB, 8, RED);
@@ -1677,7 +1812,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         ScreenToClient(h, &pt);
         float s = Scale(), x = pt.x * s, y = pt.y * s;
         bool overPill = x >= PILL.left && x < PILL.right && y >= PILL.top && y < PILL.bottom;
-        return y < HEADER && x < WIN_W - 100 && !overPill ? HTCAPTION : HTCLIENT;
+        bool overUpdate = x >= UPDATE_BTN.left && x < UPDATE_BTN.right && y >= UPDATE_BTN.top && y < UPDATE_BTN.bottom;
+        return y < HEADER && x < WIN_W - 100 && !overPill && !overUpdate ? HTCAPTION : HTCLIENT;
     }
     case WM_MOUSEMOVE: {
         float s = Scale();
@@ -1810,7 +1946,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_APP: // engine started/stopped pulling
+    case WM_APP + 2: { // update installed: save, start the new exe, quit
+        KillTimer(h, 3);
+        Save();
+        std::wstring self = SelfPath();
+        STARTUPINFOW si{sizeof si};
+        PROCESS_INFORMATION pi;
+        if (CreateProcessW(self.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+        DestroyWindow(h);
+        return 0;
+    }
+    case WM_APP + 3: { // startup check found a newer version
+        bool notify;
+        { std::lock_guard<std::mutex> l(mu); notify = cfg.notify; }
+        InvalidateRect(h, nullptr, FALSE);
+        if (notify) Notify(L"Update available", ACCENT);
+        return 0;
+    }
+    case WM_APP: // engine started/stopped pulling, or the update state changed
         InvalidateRect(h, nullptr, FALSE);
         return 0;
 
@@ -1905,6 +2061,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
 
     std::thread(HookThread).detach();
     std::thread(Engine, hwnd).detach();
+    std::thread([] { // the exe an update replaced has exited by now; then see if there's a newer one
+        Sleep(3000);
+        DeleteFileW((SelfPath() + L".old").c_str());
+        if (updState != UPD_IDLE) return; // the button got there first
+        if (FindUpdate()) PostMessageW(hwnd, WM_APP + 3, 0, 0);
+        else if (updState == UPD_FAILED) updState = UPD_IDLE; // offline at startup isn't worth a red button
+        PostMessageW(hwnd, WM_APP, 0, 0);
+    }).detach();
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
