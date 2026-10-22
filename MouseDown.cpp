@@ -41,7 +41,7 @@ struct Profile {
     // auto spam: hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
     bool spamOn = false, spamDelayOff = false;
     bool spamPull = false; // pull runs the whole time auto spam is clicking, in any activation mode
-    int spamTrigger = 0, spamRequire = 0, spamKey = 0;
+    int spamTrigger = VK_RBUTTON, spamRequire = VK_LBUTTON, spamKey = 0;
     float spamRate = 10, spamDelay = 0, spamJitter = 0; // spamDelay: ms held before clicking; spamJitter: ±% per interval
     bool off[OFF_BITS] = {}; // per-feature switch (FieldDef::bit); off acts like the value is 0, keeping the value
     // group ("parent profile"): pulls with the profile in its active slot; each slot has a key that picks it
@@ -249,8 +249,8 @@ static void LoadSettings() {
         p.spamOn = get(sec, L"spamOn", 0, 0, 1) != 0; // off unless this profile turned it on
         p.spamPull = spam(L"spamPull", 0, 0, 1) != 0;
         p.spamDelayOff = spam(L"spamDelayOff", 0, 0, 1) != 0;
-        p.spamTrigger = (int)spam(L"spamTrigger", 0, 0, 254);
-        p.spamRequire = (int)spam(L"spamRequire", 0, 0, 254);
+        p.spamTrigger = (int)spam(L"spamTrigger", p.spamTrigger, 0, 254);
+        p.spamRequire = (int)spam(L"spamRequire", p.spamRequire, 0, 254);
         p.spamKey = (int)spam(L"spamKey", 0, 0, 254);
         for (auto& d : spamDefs) p.*d.f = (float)spam(d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : fields) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);

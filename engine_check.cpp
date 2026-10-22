@@ -114,8 +114,9 @@ int main() {
     gc.listShow = 2;
     assert(VisibleProfiles(gc, vg) == 2 && vg[0] == 0 && vg[1] == 1); // 0 is a profile, but it's the active one
 
-    // New profiles hold right mouse and also require left mouse
-    assert(Profile{}.holdKey == VK_RBUTTON && Profile{}.requireKey == VK_LBUTTON);
+    // New profiles hold right mouse and also require left mouse, for the pull and for auto spam (which starts off)
+    assert(Profile{}.holdKey == VK_RBUTTON && Profile{}.requireKey == VK_LBUTTON &&
+           Profile{}.spamTrigger == VK_RBUTTON && Profile{}.spamRequire == VK_LBUTTON && !Profile{}.spamOn);
 
     // Settings survive a save and load, non-ASCII names and deleted profiles included
     GetTempPathW(MAX_PATH, ini);
