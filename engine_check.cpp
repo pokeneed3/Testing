@@ -107,8 +107,9 @@ int main() {
     // Settings survive a save and load, non-ASCII names and deleted profiles included
     GetTempPathW(MAX_PATH, ini);
     wcscat_s(ini, L"engine_check.ini");
-    cfg.n = 3, cfg.cur = 2, cfg.prevKey = VK_F6, cfg.accent = 3, cfg.spamJitter = 12;
+    cfg.n = 3, cfg.cur = 2, cfg.prevKey = VK_F6, cfg.accent = 3;
     cfg.p[1] = a;
+    cfg.p[1].spamJitter = 12, cfg.p[1].spamKey = VK_LBUTTON;
     cfg.p[0].group = true, cfg.p[0].child[0] = 1, cfg.p[0].childKey[1] = '2', cfg.p[0].childSel = 1;
     wcscpy_s(cfg.p[0].name, L"Spray ü");
     wcscpy_s(cfg.port, L"COM7");
@@ -120,11 +121,20 @@ int main() {
     assert(!wcscmp(gone, L"none")); // the deleted profile's section is gone
     cfg = Config{};
     LoadSettings();
-    assert(cfg.n == 2 && cfg.cur == 1 && cfg.prevKey == VK_F6 && cfg.accent == 3 && cfg.spamJitter == 12);
+    assert(cfg.n == 2 && cfg.cur == 1 && cfg.prevKey == VK_F6 && cfg.accent == 3);
     assert(cfg.p[1].vy == 123 && cfg.p[1].off[9] && !wcscmp(cfg.p[1].name, L"A;b=c") && !wcscmp(cfg.port, L"COM7"));
+    assert(cfg.p[1].spamJitter == 12 && cfg.p[1].spamKey == VK_LBUTTON && cfg.p[0].spamKey == 0); // spam is per profile
     assert(!wcscmp(cfg.p[0].name, L"Spray ü"));
     assert(cfg.p[0].group && cfg.p[0].child[0] == 1 && cfg.p[0].child[1] == -1 && cfg.p[0].childKey[1] == '2' &&
            cfg.p[0].childSel == 1 && !cfg.p[1].group);
+    // Auto spam saved before it was per profile: a profile without its own starts from the old shared setting
+    WritePrivateProfileStringW(L"general", L"spamKey", L"1", ini);
+    WritePrivateProfileStringW(L"general", L"spamRate", L"25", ini);
+    WritePrivateProfileStringW(L"profile1", L"spamKey", nullptr, ini);
+    WritePrivateProfileStringW(L"profile1", L"spamRate", nullptr, ini);
+    cfg = Config{};
+    LoadSettings();
+    assert(cfg.p[0].spamKey == VK_LBUTTON && cfg.p[0].spamRate == 25 && cfg.p[1].spamRate == 10);
     DeleteFileW(ini);
     puts("engine ok");
 }

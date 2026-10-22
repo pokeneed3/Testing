@@ -38,6 +38,11 @@ struct Profile {
     float vy2 = 300, vx2 = 0, at2 = 0, vy3 = 300, vx3 = 0, at3 = 0; // stages 2/3: pull from atN ms on (0 = off)
     float growEvery = 0, growY = 0, growX = 0; // every growEvery ms held, pull gains growY/growX px/s (0 = off)
     float sway = 0, swayMs = 500; // horizontal sway: ±sway px/s, one full cycle every swayMs (0 = off)
+    // auto spam: hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
+    bool spamOn = false, spamDelayOff = false;
+    bool spamPull = false; // pull runs the whole time auto spam is clicking, in any activation mode
+    int spamTrigger = 0, spamRequire = 0, spamKey = 0;
+    float spamRate = 10, spamDelay = 0, spamJitter = 0; // spamDelay: ms held before clicking; spamJitter: ±% per interval
     bool off[OFF_BITS] = {}; // per-feature switch (FieldDef::bit); off acts like the value is 0, keeping the value
     // group ("parent profile"): pulls with the profile in its active slot; each slot has a key that picks it
     bool group = false;
@@ -57,13 +62,9 @@ struct Config {
     bool switchGroups = false; // wheel, quick switch and next/prev move between groups only
     bool sound = false; // beep on on/off and profile switches
     int accent = 0; // UI colour, index into accents[]
-    int spamTrigger = 0, spamRequire = 0, spamKey = 0; // hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
     int wheelKey = 0; // hold to show the profile wheel
-    float sens = 100, spamRate = 10, spamDelay = 0; // spamDelay: ms the spam keys must be held before clicking
-    float spamJitter = 0; // ±% random change of each click interval
-    bool spamDelayOff = false;
-    bool enabled = true, onTop = false, spamOn = false, notify = true;
-    bool spamPull = false; // pull runs the whole time auto spam is clicking, in any activation mode
+    float sens = 100;
+    bool enabled = true, onTop = false, notify = true;
     wchar_t port[16] = L""; // serial COM port of the HID board; empty = inject with SendInput
 };
 
@@ -97,9 +98,11 @@ static const FieldDef swayDefs[] = { // own pair, kept out of fields[] so its in
     {L"swayMs", L"Sway period", L"%.0f ms", nullptr, &Profile::swayMs, 100, 3000, 10},
 };
 static const FieldDef sensDef = {L"sens", L"Sensitivity", L"%.0f%%", nullptr, nullptr, 10, 300, 5, -1, &Config::sens};
-static const FieldDef spamDef = {L"spamRate", L"Rate", L"%.0f /s", nullptr, nullptr, 1, 50, 1, -1, &Config::spamRate};
-static const FieldDef spamDelayDef = {L"spamDelay", L"Delay", L"%.0f ms", L"Instant", nullptr, 0, 2000, 10, -1, &Config::spamDelay};
-static const FieldDef spamJitterDef = {L"spamJitter", L"Rate jitter", L"±%.0f%%", L"Off", nullptr, 0, 50, 1, -1, &Config::spamJitter};
+static const FieldDef spamDefs[] = { // auto spam's sliders; saved with their own code, so not in ForFields
+    {L"spamRate", L"Rate", L"%.0f /s", nullptr, &Profile::spamRate, 1, 50, 1},
+    {L"spamDelay", L"Delay", L"%.0f ms", L"Instant", &Profile::spamDelay, 0, 2000, 10},
+    {L"spamJitter", L"Rate jitter", L"±%.0f%%", L"Off", &Profile::spamJitter, 0, 50, 1},
+};
 const int STAGE_FIELDS = 8, PULL_FIELDS = 11; // fields[] layout: 8 stage fields, jitter, offset min/max, then Timing
 const double SPAM_HOLD_MS = 15; // how long each spam click stays pressed (shorter at high rates)
 const double TAP_MS = 150;    // tap-mode pull length when Pull duration is Unlimited
@@ -202,17 +205,8 @@ static void LoadSettings() {
     cfg.sens = (float)get(L"general", L"sens", cfg.sens, sensDef.lo, sensDef.hi);
     cfg.enabled = get(L"general", L"enabled", 1, 0, 1) != 0;
     cfg.onTop = get(L"general", L"onTop", 0, 0, 1) != 0;
-    cfg.spamOn = get(L"general", L"spamOn", 0, 0, 1) != 0;
     cfg.notify = get(L"general", L"notify", 1, 0, 1) != 0;
-    cfg.spamPull = get(L"general", L"spamPull", 0, 0, 1) != 0;
     cfg.wheelKey = (int)get(L"general", L"wheelKey", cfg.wheelKey, 0, 254);
-    cfg.spamTrigger = (int)get(L"general", L"spamTrigger", cfg.spamTrigger, 0, 254);
-    cfg.spamRequire = (int)get(L"general", L"spamRequire", cfg.spamRequire, 0, 254);
-    cfg.spamKey = (int)get(L"general", L"spamKey", cfg.spamKey, 0, 254);
-    cfg.spamRate = (float)get(L"general", L"spamRate", cfg.spamRate, spamDef.lo, spamDef.hi);
-    cfg.spamDelay = (float)get(L"general", L"spamDelay", cfg.spamDelay, spamDelayDef.lo, spamDelayDef.hi);
-    cfg.spamDelayOff = get(L"general", L"spamDelayOff", 0, 0, 1) != 0;
-    cfg.spamJitter = (float)get(L"general", L"spamJitter", cfg.spamJitter, spamJitterDef.lo, spamJitterDef.hi);
     cfg.pauseKey = (int)get(L"general", L"pauseKey", cfg.pauseKey, 0, 254);
     cfg.sound = get(L"general", L"sound", 0, 0, 1) != 0;
     cfg.accent = (int)get(L"general", L"accent", 0, 0, ACCENTS - 1);
@@ -241,6 +235,15 @@ static void LoadSettings() {
         p.childKey[0] = (int)get(sec, L"slot1Key", 0, 0, 254);
         p.childKey[1] = (int)get(sec, L"slot2Key", 0, 0, 254);
         p.childSel = (int)get(sec, L"slot", 0, 0, 1);
+        // auto spam used to be one setting for all profiles: a profile without its own starts from that
+        auto spam = [&](const wchar_t* k, double def, double lo, double hi) { return get(sec, k, get(L"general", k, def, lo, hi), lo, hi); };
+        p.spamOn = spam(L"spamOn", 0, 0, 1) != 0;
+        p.spamPull = spam(L"spamPull", 0, 0, 1) != 0;
+        p.spamDelayOff = spam(L"spamDelayOff", 0, 0, 1) != 0;
+        p.spamTrigger = (int)spam(L"spamTrigger", 0, 0, 254);
+        p.spamRequire = (int)spam(L"spamRequire", 0, 0, 254);
+        p.spamKey = (int)spam(L"spamKey", 0, 0, 254);
+        for (auto& d : spamDefs) p.*d.f = (float)spam(d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : fields) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : growDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : swayDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
@@ -272,17 +275,8 @@ static void Save() {
     put(L"sens", c.sens);
     put(L"enabled", c.enabled);
     put(L"onTop", c.onTop);
-    put(L"spamOn", c.spamOn);
     put(L"notify", c.notify);
-    put(L"spamPull", c.spamPull);
     put(L"wheelKey", c.wheelKey);
-    put(L"spamTrigger", c.spamTrigger);
-    put(L"spamRequire", c.spamRequire);
-    put(L"spamKey", c.spamKey);
-    put(L"spamRate", c.spamRate);
-    put(L"spamDelay", c.spamDelay);
-    put(L"spamDelayOff", c.spamDelayOff);
-    put(L"spamJitter", c.spamJitter);
     put(L"pauseKey", c.pauseKey);
     put(L"sound", c.sound);
     put(L"accent", c.accent);
@@ -315,6 +309,13 @@ static void Save() {
         }
         ForFields([&](const FieldDef& d) { put(d.key, p.*d.f); });
         ForSwitches([&](const FieldDef& d) { put((std::wstring(d.key) + L"Off").c_str(), p.off[d.bit]); });
+        put(L"spamOn", p.spamOn);
+        put(L"spamPull", p.spamPull);
+        put(L"spamDelayOff", p.spamDelayOff);
+        put(L"spamTrigger", p.spamTrigger);
+        put(L"spamRequire", p.spamRequire);
+        put(L"spamKey", p.spamKey);
+        for (auto& d : spamDefs) put(d.key, p.*d.f);
     }
     std::wstring tmp = std::wstring(ini) + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -347,6 +348,13 @@ static std::wstring ExportProfile(const Profile& p) {
     }
     ForFields([&](const FieldDef& d) { add(d.key, p.*d.f); });
     ForSwitches([&](const FieldDef& d) { add(std::wstring(d.key) + L"Off", p.off[d.bit]); });
+    add(L"spamOn", p.spamOn);
+    add(L"spamPull", p.spamPull);
+    add(L"spamDelayOff", p.spamDelayOff);
+    add(L"spamTrigger", p.spamTrigger);
+    add(L"spamRequire", p.spamRequire);
+    add(L"spamKey", p.spamKey);
+    for (auto& d : spamDefs) add(d.key, p.*d.f);
     return s + L";name=" + p.name;
 }
 
@@ -375,6 +383,14 @@ static bool ImportProfile(const wchar_t* s, Profile& p) {
             if (k == L"slot2") q.child[1] = std::clamp((int)v, -1, MAX_PROFILES - 1);
             if (k == L"slot1Key") q.childKey[0] = std::clamp((int)v, 0, 254);
             if (k == L"slot2Key") q.childKey[1] = std::clamp((int)v, 0, 254);
+            if (k == L"spamOn") q.spamOn = v != 0;
+            if (k == L"spamPull") q.spamPull = v != 0;
+            if (k == L"spamDelayOff") q.spamDelayOff = v != 0;
+            if (k == L"spamTrigger") q.spamTrigger = std::clamp((int)v, 0, 254);
+            if (k == L"spamRequire") q.spamRequire = std::clamp((int)v, 0, 254);
+            if (k == L"spamKey") q.spamKey = std::clamp((int)v, 0, 254);
+            for (auto& d : spamDefs)
+                if (k == d.key) q.*d.f = (float)std::clamp(v, (double)d.lo, (double)d.hi);
             ForFields([&](const FieldDef& d) {
                 if (k == d.key) q.*d.f = (float)std::clamp(v, (double)d.lo, (double)d.hi);
                 if (d.bit >= 0 && k == std::wstring(d.key) + L"Off") q.off[d.bit] = v != 0;
@@ -586,6 +602,7 @@ static void Engine(HWND hwnd) {
     bool slotWas[2] = {}, swapWas = false;
     double vx = 0, vy = 0, ax = 0, ay = 0, jx = 1, jy = 1, nextJitter = 0, ox = 0, oy = 0, spamAt = 0, spamUpAt = 0;
     int spamVk = 0;         // key currently pressed by spam (0 = none)
+    int spamLast = 0;       // the key spam was clicking last tick, to hand back to the game when it stops
     bool spamWas = false;
     double spamSince = -1; // when the spam keys went down (-1 = not held)
     Config c;
@@ -663,12 +680,12 @@ static void Engine(HWND hwnd) {
             pausedNow = paused;
             PostMessageW(hwnd, WM_APP, 0, 0);
         }
-        bool spamKeys = c.enabled && c.spamOn && !cap && !paused && c.spamKey && Down(c.spamTrigger) &&
-                        (!c.spamRequire || Down(c.spamRequire));
+        bool spamKeys = c.enabled && p.spamOn && run >= 0 && !cap && !paused && p.spamKey && Down(p.spamTrigger) &&
+                        (!p.spamRequire || Down(p.spamRequire));
         if (!spamKeys) spamSince = -1;
         else if (spamSince < 0) spamSince = nowMs;
-        bool spam = spamKeys && nowMs - spamSince >= (c.spamDelayOff ? 0 : c.spamDelay); // keys must be held spamDelay ms first
-        bool spamPulls = spam && c.spamPull;
+        bool spam = spamKeys && nowMs - spamSince >= (p.spamDelayOff ? 0 : p.spamDelay); // keys must be held spamDelay ms first
+        bool spamPulls = spam && p.spamPull;
 
         bool req = !p.requireKey || Down(p.requireKey), restart;
         bool active = Step(trig, p.mode, Down(p.holdKey) && req, req, spamPulls, c.enabled && !cap && !paused && run >= 0, wasActive,
@@ -743,16 +760,17 @@ static void Engine(HWND hwnd) {
             spamVk = 0;
         }
         if (spam && !spamVk && nowMs >= spamAt) {
-            double period = 1000 / c.spamRate * (1 + c.spamJitter / 100 * uni(rng));
-            spamVk = c.spamKey;
+            double period = 1000 / p.spamRate * (1 + p.spamJitter / 100 * uni(rng));
+            spamVk = p.spamKey;
             SendKey(spamVk, true);
             spamUpAt = nowMs + std::min(SPAM_HOLD_MS, period / 2);
             spamAt = nowMs + period;
         }
         if (!spam) spamAt = 0; // first click fires right on press
-        if (spamWas && !spam && c.spamKey && Down(c.spamKey))
-            SendKey(c.spamKey, true); // still physically held: hand the button back down to the game
+        if (spamWas && !spam && spamLast && Down(spamLast))
+            SendKey(spamLast, true); // still physically held: hand the button back down to the game
         spamWas = spam;
+        if (spam) spamLast = p.spamKey;
 
         LARGE_INTEGER due;
         due.QuadPart = -(LONGLONG)(10'000'000 / p.tickHz); // 100 ns units, negative = relative
@@ -1592,15 +1610,19 @@ static void Frame(float W) {
         }
         KeyBind(L"Profile hotkey", g.hotkey, 236, 284, 268);
 
-        Card(220, 348, 300, 464, L"AUTO SPAM");
-        Toggle(L"Enabled", cfg.spamOn, 236, 384, 268);
-        KeyBind(L"Hold to spam", cfg.spamTrigger, 236, 428, 268);
-        KeyBind(L"Also require", cfg.spamRequire, 236, 472, 268);
-        KeyBind(L"Key to spam", cfg.spamKey, 236, 516, 268);
-        Slider(spamDef, cfg.spamRate, 236, 562, 126);
-        Slider(spamDelayDef, cfg.spamDelay, 378, 562, 126, &cfg.spamDelayOff);
-        Toggle(L"Clicks trigger pull", cfg.spamPull, 236, 612, 268);
-        Slider(spamJitterDef, cfg.spamJitter, 236, 658, 268);
+        wchar_t spamTitle[48] = L"AUTO SPAM";
+        if (g.group && runIdx >= 0) swprintf_s(spamTitle, L"AUTO SPAM  ·  %s", *p.name ? p.name : L"Untitled");
+        Card(220, 348, 300, 464, spamTitle);
+        if (runIdx >= 0) {
+            Toggle(L"Enabled", p.spamOn, 236, 384, 268);
+            KeyBind(L"Hold to spam", p.spamTrigger, 236, 428, 268);
+            KeyBind(L"Also require", p.spamRequire, 236, 472, 268);
+            KeyBind(L"Key to spam", p.spamKey, 236, 516, 268);
+            Slider(spamDefs[0], p.spamRate, 236, 562, 126);
+            Slider(spamDefs[1], p.spamDelay, 378, 562, 126, &p.spamDelayOff);
+            Toggle(L"Clicks trigger pull", p.spamPull, 236, 612, 268);
+            Slider(spamDefs[2], p.spamJitter, 236, 658, 268);
+        }
 
         // pull, then timing + curve on the right
         Card(940, 424, 300, 388, L"CURVE");
