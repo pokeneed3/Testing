@@ -488,15 +488,22 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
 
 // Own thread so a busy UI thread can never stall system-wide input.
 static void HookThread() {
-    hooked = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0) &&
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL); // answer fast, or Windows skips the hook
+    hooked =SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0) &&
              SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, GetModuleHandleW(nullptr), 0);
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {}
 }
 
+// Held = the hook saw it go down (so our own injected clicks don't count) AND Windows says it's down now.
+// Windows skips a hook that's slow to answer, so the hook alone can miss a release and leave a key stuck down.
 static bool Down(int vk) {
     if (!vk) return false;
-    if (!hooked) return GetAsyncKeyState(vk) & 0x8000;
+    int async = vk;
+    if ((vk == VK_LBUTTON || vk == VK_RBUTTON) && GetSystemMetrics(SM_SWAPBUTTON))
+        async = vk == VK_LBUTTON ? VK_RBUTTON : VK_LBUTTON; // GetAsyncKeyState reads the physical buttons
+    if (!(GetAsyncKeyState(async) & 0x8000)) return false;
+    if (!hooked) return true;
     switch (vk) { // LL hooks report the left/right variants only
     case VK_SHIFT: return phys[VK_LSHIFT] || phys[VK_RSHIFT];
     case VK_CONTROL: return phys[VK_LCONTROL] || phys[VK_RCONTROL];
