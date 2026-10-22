@@ -425,6 +425,7 @@ enum { EV_ON = 1, EV_OFF, EV_PROFILE, EV_SLOT }; // wParam of WM_APP + 1
 // Physical key/button state from low-level hooks, which skip injected input. Our own spam clicks
 // would otherwise read as the user letting go (e.g. spamming Left Mouse while Left Mouse is held).
 static std::atomic<bool> phys[256];
+static std::atomic<bool> held[256]; // what the engine reads: the latest word from the hooks or raw input, whichever speaks first
 static std::atomic<bool> hooked;
 
 // ---------- diagnostic log ----------
@@ -517,7 +518,7 @@ static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
         case WM_XBUTTONDOWN: case WM_XBUTTONUP: bvk = HIWORD(m->mouseData) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2; break;
         }
         if (bvk) {
-            phys[bvk] = bdown;
+            phys[bvk] = held[bvk] = bdown;
             if (diagOn && Watched(bvk)) Diag("hook    %s %s", VkLabel(bvk).c_str(), bdown ? "down" : "up");
         }
     }
@@ -541,7 +542,7 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
             return 1;
         }
         if (diagOn && phys[vk] != down && Watched(vk)) Diag("hook    %s %s", VkLabel(vk).c_str(), down ? "down" : "up");
-        phys[vk] = down;
+        phys[vk] = held[vk] = down;
     }
     return CallNextHookEx(nullptr, code, wp, lp);
 }
@@ -562,6 +563,7 @@ static void RawSaw(int vk, bool down) {
     if (sentDir[vk] == (down ? 1 : 2) && GetTickCount64() - sentTick[vk] < 50) rawEcho[vk] = true;
     rawDown[vk] = down;
     rawSeen[vk] = true;
+    if (!rawEcho[vk]) held[vk] = down;
 }
 
 static void HandleRaw(const RAWINPUT& ri) {
@@ -599,24 +601,12 @@ static void HandleRaw(const RAWINPUT& ri) {
     }
 }
 
-// A gaming mouse floods raw input with thousands of movement events a second while a game is focused. Reading
-// them one WM_INPUT at a time lets that flood back up ahead of the button and key presses the engine waits on,
-// so the pull started seconds late. Draining the whole queue each wake with GetRawInputBuffer keeps up.
 static LRESULT CALLBACK RawProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg != WM_INPUT) return DefWindowProcW(w, msg, wp, lp);
-    alignas(8) BYTE buf[16 * 1024];
-    for (;;) {
-        UINT bytes = sizeof buf;
-        UINT n = GetRawInputBuffer((PRAWINPUT)buf, &bytes, sizeof(RAWINPUTHEADER));
-        if (n == 0 || n == (UINT)-1) break; // queue drained, or an error we retry on the next event
-        BYTE* r = buf;
-        for (UINT i = 0; i < n; i++) {
-            auto* ri = (RAWINPUT*)r;
-            HandleRaw(*ri);
-            r += (ri->header.dwSize + 7) & ~(ULONG_PTR)7; // next record, 8-byte aligned on x64
-        }
-    }
-    return 0;
+    RAWINPUT ri;
+    UINT sz = sizeof ri;
+    if (msg == WM_INPUT && GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &sz, sizeof(RAWINPUTHEADER)) != (UINT)-1)
+        HandleRaw(ri);
+    return DefWindowProcW(w, msg, wp, lp);
 }
 
 static std::atomic<bool> rawOk;
@@ -647,20 +637,18 @@ static bool rawHas(int vk) { // raw has delivered this key at least once (L/R va
     return rawSeen[vk & 255];
 }
 
-// Held, as the player is pressing it. Raw input for a key once it has actually delivered that key, else the
-// hooks (they skip our own injected clicks too), else GetAsyncKeyState. A mouse reports movement through raw
-// but can route its buttons elsewhere, so movement alone must not pull a button off the timely hooks.
+// Held, as the player is pressing it. Both the hooks and raw input report real presses only (not our own
+// injected clicks), and each has run seconds late in some setup, so whichever reports a change first sets it.
+// GetAsyncKeyState only until either has reported that key.
 static bool Down(int vk) {
     if (!vk) return false;
-    bool raw = rawOk && rawHas(vk) && !rawEcho[vk & 255];
-    const std::atomic<bool>* st = raw ? rawDown : hooked ? phys : nullptr;
-    if (!st) return GetAsyncKeyState(vk) & 0x8000;
+    if (!hooked && !(rawOk && rawHas(vk))) return GetAsyncKeyState(vk) & 0x8000;
     switch (vk) { // only the left/right variants are tracked
-    case VK_SHIFT: return st[VK_LSHIFT] || st[VK_RSHIFT];
-    case VK_CONTROL: return st[VK_LCONTROL] || st[VK_RCONTROL];
-    case VK_MENU: return st[VK_LMENU] || st[VK_RMENU];
+    case VK_SHIFT: return held[VK_LSHIFT] || held[VK_RSHIFT];
+    case VK_CONTROL: return held[VK_LCONTROL] || held[VK_RCONTROL];
+    case VK_MENU: return held[VK_LMENU] || held[VK_RMENU];
     }
-    return st[vk];
+    return held[vk & 255];
 }
 
 static bool Extended(int vk) { // keys whose scan code needs the E0 prefix
