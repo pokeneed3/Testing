@@ -550,6 +550,7 @@ static LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
 // can't be skipped when Windows is busy, and unlike GetAsyncKeyState it doesn't lag behind while a game has
 // focus. Our own SendInput clicks come with no device, so they never count as the player holding a button.
 static std::atomic<bool> rawDown[256];
+static std::atomic<bool> rawSeen[256];       // raw input has delivered this exact key, so it's safe to trust for it
 static std::atomic<bool> rawMouse, rawKeys;  // raw input has delivered real device input of that kind
 // Windows sends our own SendInput events to raw input without a device. Should some setup echo them with one,
 // raw input can't tell our clicks from the player's for that key, and the hooks decide it instead.
@@ -560,6 +561,7 @@ static void RawSaw(int vk, bool down) {
     if (diagOn && rawDown[vk] != down && Watched(vk)) Diag("raw     %s %s", VkLabel(vk).c_str(), down ? "down" : "up");
     if (sentDir[vk] == (down ? 1 : 2) && GetTickCount64() - sentTick[vk] < 50) rawEcho[vk] = true;
     rawDown[vk] = down;
+    rawSeen[vk] = true;
 }
 
 static void HandleRaw(const RAWINPUT& ri) {
@@ -636,12 +638,21 @@ static void HookThread() {
     while (GetMessageW(&m, nullptr, 0, 0) > 0) DispatchMessageW(&m);
 }
 
-// Held, as the player is pressing it. Raw input when it's delivering that kind of device, else the hooks
-// (they skip our own injected clicks too), else GetAsyncKeyState.
+static bool rawHas(int vk) { // raw has delivered this key at least once (L/R variants for the combined modifiers)
+    switch (vk) {
+    case VK_SHIFT: return rawSeen[VK_LSHIFT] || rawSeen[VK_RSHIFT];
+    case VK_CONTROL: return rawSeen[VK_LCONTROL] || rawSeen[VK_RCONTROL];
+    case VK_MENU: return rawSeen[VK_LMENU] || rawSeen[VK_RMENU];
+    }
+    return rawSeen[vk & 255];
+}
+
+// Held, as the player is pressing it. Raw input for a key once it has actually delivered that key, else the
+// hooks (they skip our own injected clicks too), else GetAsyncKeyState. A mouse reports movement through raw
+// but can route its buttons elsewhere, so movement alone must not pull a button off the timely hooks.
 static bool Down(int vk) {
     if (!vk) return false;
-    bool mouse = vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
-    bool raw = rawOk && (mouse ? rawMouse : rawKeys) && !rawEcho[vk & 255];
+    bool raw = rawOk && rawHas(vk) && !rawEcho[vk & 255];
     const std::atomic<bool>* st = raw ? rawDown : hooked ? phys : nullptr;
     if (!st) return GetAsyncKeyState(vk) & 0x8000;
     switch (vk) { // only the left/right variants are tracked
