@@ -104,7 +104,7 @@ int main() {
     gc.p[0].group = gc.p[2].group = false;
     assert(SwitchTargets(gc, tg) == 3);
 
-    // The list shows everything, only profiles or only groups; the active one always shows
+    // The list shows everything, only profiles or only groups (whatever is active)
     gc.p[1].group = true, gc.cur = 0;
     int vg[MAX_PROFILES];
     gc.listShow = 0;
@@ -112,11 +112,13 @@ int main() {
     gc.listShow = 1;
     assert(VisibleProfiles(gc, vg) == 2 && vg[0] == 0 && vg[1] == 2);
     gc.listShow = 2;
-    assert(VisibleProfiles(gc, vg) == 2 && vg[0] == 0 && vg[1] == 1); // 0 is a profile, but it's the active one
+    assert(VisibleProfiles(gc, vg) == 1 && vg[0] == 1); // 0 is active, but it isn't a group
 
-    // New profiles hold right mouse and also require left mouse, for the pull and for auto spam (which starts off)
+    // New profiles hold right mouse and also require left mouse, for the pull and for auto spam (which starts
+    // off, spams left mouse and drives the pull)
     assert(Profile{}.holdKey == VK_RBUTTON && Profile{}.requireKey == VK_LBUTTON &&
-           Profile{}.spamTrigger == VK_RBUTTON && Profile{}.spamRequire == VK_LBUTTON && !Profile{}.spamOn);
+           Profile{}.spamTrigger == VK_RBUTTON && Profile{}.spamRequire == VK_LBUTTON && !Profile{}.spamOn &&
+           Profile{}.spamKey == VK_LBUTTON && Profile{}.spamPull);
 
     // Settings survive a save and load, non-ASCII names and deleted profiles included
     GetTempPathW(MAX_PATH, ini);
@@ -137,7 +139,7 @@ int main() {
     LoadSettings();
     assert(cfg.n == 2 && cfg.cur == 1 && cfg.prevKey == VK_F6 && cfg.accent == 3);
     assert(cfg.p[1].vy == 123 && cfg.p[1].off[9] && !wcscmp(cfg.p[1].name, L"A;b=c") && !wcscmp(cfg.port, L"COM7"));
-    assert(cfg.p[1].spamJitter == 12 && cfg.p[1].spamKey == VK_LBUTTON && cfg.p[0].spamKey == 0); // spam is per profile
+    assert(cfg.p[1].spamJitter == 12 && cfg.p[1].spamKey == VK_LBUTTON && cfg.p[0].spamKey == VK_LBUTTON); // spam is per profile
     assert(!wcscmp(cfg.p[0].name, L"Spray ü"));
     assert(cfg.p[0].group && cfg.p[0].child[0] == 1 && cfg.p[0].child[1] == -1 && cfg.p[0].childKey[1] == '2' &&
            cfg.p[0].childSel == 1 && !cfg.p[1].group);

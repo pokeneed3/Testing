@@ -43,8 +43,8 @@ struct Profile {
     float sway = 0, swayMs = 500; // horizontal sway: ±sway px/s, one full cycle every swayMs (0 = off)
     // auto spam: hold spamTrigger (+ spamRequire if set) to repeatedly tap spamKey
     bool spamOn = false, spamDelayOff = false;
-    bool spamPull = false; // pull runs the whole time auto spam is clicking, in any activation mode
-    int spamTrigger = VK_RBUTTON, spamRequire = VK_LBUTTON, spamKey = 0;
+    bool spamPull = true; // pull runs the whole time auto spam is clicking, in any activation mode
+    int spamTrigger = VK_RBUTTON, spamRequire = VK_LBUTTON, spamKey = VK_LBUTTON;
     float spamRate = 10, spamDelay = 0, spamJitter = 0; // spamDelay: ms held before clicking; spamJitter: ±% per interval
     bool off[OFF_BITS] = {}; // per-feature switch (FieldDef::bit); off acts like the value is 0, keeping the value
     // group ("parent profile"): pulls with the profile in its active slot; each slot has a key that picks it
@@ -148,12 +148,11 @@ static int SwitchTargets(const Config& c, int* out) {
     return m;
 }
 
-// The profile list's rows, in list order: everything, only normal profiles or only groups. The active
-// profile always shows, so the one being edited never disappears. Returns how many.
+// The profile list's rows, in list order: everything, only normal profiles or only groups. Returns how many.
 static int VisibleProfiles(const Config& c, int* out) {
     int m = 0;
     for (int i = 0; i < c.n; i++)
-        if (c.listShow == 0 || (c.listShow == 1) != c.p[i].group || i == c.cur) out[m++] = i;
+        if (c.listShow == 0 || (c.listShow == 1) != c.p[i].group) out[m++] = i;
     return m;
 }
 
@@ -252,11 +251,11 @@ static void LoadSettings() {
         // auto spam used to be one setting for all profiles: a profile without its own starts from that
         auto spam = [&](const wchar_t* k, double def, double lo, double hi) { return get(sec, k, get(L"general", k, def, lo, hi), lo, hi); };
         p.spamOn = get(sec, L"spamOn", 0, 0, 1) != 0; // off unless this profile turned it on
-        p.spamPull = spam(L"spamPull", 0, 0, 1) != 0;
+        p.spamPull = spam(L"spamPull", p.spamPull, 0, 1) != 0;
         p.spamDelayOff = spam(L"spamDelayOff", 0, 0, 1) != 0;
         p.spamTrigger = (int)spam(L"spamTrigger", p.spamTrigger, 0, 254);
         p.spamRequire = (int)spam(L"spamRequire", p.spamRequire, 0, 254);
-        p.spamKey = (int)spam(L"spamKey", 0, 0, 254);
+        p.spamKey = (int)spam(L"spamKey", p.spamKey, 0, 254);
         for (auto& d : spamDefs) p.*d.f = (float)spam(d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : fields) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : growDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
@@ -1078,7 +1077,10 @@ static std::wstring KeyName(int vk) {
 }
 
 static D2D1_RECT_F R(float x, float y, float w, float h) { return {x, y, x + w, y + h}; }
-static bool In(D2D1_RECT_F r) { return in.mx >= r.left && in.mx < r.right && in.my >= r.top && in.my < r.bottom; }
+static D2D1_RECT_F dropBlock; // an open dropdown list: it's on top, so nothing under it gets the mouse
+static bool dropOn;
+static bool InRaw(D2D1_RECT_F r) { return in.mx >= r.left && in.mx < r.right && in.my >= r.top && in.my < r.bottom; }
+static bool In(D2D1_RECT_F r) { return InRaw(r) && !(dropOn && InRaw(dropBlock)); }
 static void Color(UINT32 c, float a = 1) { br->SetColor(D2D1::ColorF(c, a)); }
 static void Fill(D2D1_RECT_F r, float rad, UINT32 c, float a = 1) { Color(c, a); rt->FillRoundedRectangle({r, rad, rad}, br); }
 static void Stroke(D2D1_RECT_F r, float rad, UINT32 c, float w = 1) { // inset half a pixel so 1px lines stay crisp
@@ -1508,30 +1510,101 @@ static void ProfileLabel(const Config& c, int i, wchar_t* out, size_t cap) {
     else wcscpy_s(out, cap, n);
 }
 
-// Slot picker: ‹ name ›. The left half steps back, the right half (or the mouse wheel) forward, through
-// None and the normal profiles.
-static void ProfilePick(int& idx, D2D1_RECT_F b, bool active) {
-    bool hover = In(b);
-    auto step = [&](int dir) {
-        int k = idx < cfg.n ? idx : -1;
-        do {
-            k += dir;
-            if (k < -1) k = cfg.n - 1;
-            if (k >= cfg.n) k = -1;
-        } while (k >= 0 && cfg.p[k].group);
-        idx = k;
-        saveReq = true;
-    };
+// Dropdown for picking a profile: a group slot's (None + the normal profiles), or which one to edit (all).
+// The open list is drawn last, over everything, by DrawDropdown.
+static int* dropTarget; // what picking writes; nullptr = closed
+static int dropKind;    // 0 = a slot, 1 = any profile
+static int dropFor;     // cfg.cur when it opened: a slot's list closes if the group changes under it
+static D2D1_RECT_F dropAnchor;
+static float dropScroll;
+const float DROP_ROW = 30;
+
+static int DropItems(int* out) {
+    int m = 0;
+    if (dropKind == 0) out[m++] = -1;
+    for (int i = 0; i < cfg.n; i++)
+        if (dropKind == 1 || !cfg.p[i].group) out[m++] = i;
+    return m;
+}
+
+static D2D1_RECT_F DropRect(int m) { // below the button, or above it if there's no room
+    float w = std::max(240.f, dropAnchor.right - dropAnchor.left), h = std::min(m, 12) * DROP_ROW + 8;
+    float top = dropAnchor.bottom + 4 + h > WIN_H - 12 ? dropAnchor.top - 4 - h : dropAnchor.bottom + 4;
+    return R(dropAnchor.left, top, w, h);
+}
+
+static void Chevron(float x, float cy, bool up) {
+    float d = up ? -1.f : 1.f;
+    Line(x - 4, cy - 2 * d, x, cy + 2 * d, MUTED, 1.5f);
+    Line(x, cy + 2 * d, x + 4, cy - 2 * d, MUTED, 1.5f);
+}
+
+static void Dropdown(int& idx, D2D1_RECT_F b, int kind, bool active) {
+    bool hover = In(b), open = dropTarget == &idx;
     if (hover) cursor = IDC_HAND;
-    if (hover && in.pressed) step(in.mx < (b.left + b.right) / 2 ? -1 : 1);
-    if (hover && in.wheel) step(in.wheel > 0 ? -1 : 1);
-    bool ok = idx >= 0 && idx < cfg.n && !cfg.p[idx].group;
-    Fill(b, 8, hover ? BTN_HOVER : BTN);
-    Stroke(b, 8, active ? ACCENT : BORDER, active ? 1.5f : 1);
-    Text(ok ? (*cfg.p[idx].name ? cfg.p[idx].name : L"Untitled") : L"None", R(b.left + 18, b.top, b.right - b.left - 36, 32),
-         fValue, ok ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
-    Text(L"‹", R(b.left + 7, b.top, 10, 32), fValue, MUTED);
-    Text(L"›", R(b.right - 15, b.top, 10, 32), fValue, MUTED);
+    if (hover && in.pressed) {
+        dropTarget = open ? nullptr : &idx;
+        if (!open) { // start scrolled so the current pick shows
+            dropAnchor = b, dropKind = kind, dropFor = cfg.cur;
+            int items[MAX_PROFILES + 1], m = DropItems(items), at = 0;
+            for (int k = 0; k < m; k++)
+                if (items[k] == idx) at = k;
+            dropScroll = std::max(0.f, (at - 4) * DROP_ROW);
+        }
+        open = !open;
+    }
+    bool ok = idx >= 0 && idx < cfg.n && (kind == 1 || !cfg.p[idx].group);
+    Fill(b, 8, hover || open ? BTN_HOVER : BTN);
+    Stroke(b, 8, open || active ? ACCENT : BORDER, open || active ? 1.5f : 1);
+    Text(ok ? (*cfg.p[idx].name ? cfg.p[idx].name : L"Untitled") : L"None", R(b.left + 12, b.top, b.right - b.left - 36, b.bottom - b.top),
+         fValue, ok ? TEXT : MUTED);
+    Chevron(b.right - 16, (b.top + b.bottom) / 2, open);
+}
+
+// The open list, over everything. popPress / popWheel: the click and scroll that landed on it this frame;
+// pressedElsewhere: a click anywhere else, which closes it (except on its own button, which toggles it).
+static void DrawDropdown(bool popPress, float popWheel, bool pressedElsewhere) {
+    if (!dropTarget) return;
+    if ((dropTarget != &cfg.cur && dropFor != cfg.cur) || (pressedElsewhere && !InRaw(dropAnchor))) {
+        dropTarget = nullptr;
+        return;
+    }
+    int items[MAX_PROFILES + 1], m = DropItems(items);
+    D2D1_RECT_F pop = DropRect(m);
+    float w = pop.right - pop.left, h = pop.bottom - pop.top, maxScroll = std::max(0.f, m * DROP_ROW - (h - 8));
+    dropScroll = std::clamp(dropScroll - popWheel * DROP_ROW, 0.f, maxScroll);
+    dropOn = false; // its own rows take the mouse
+    Fill(R(pop.left + 2, pop.top + 4, w, h), 10, 0x000000, .35f); // shadow
+    Fill(pop, 10, CARD);
+    Stroke(pop, 10, ACCENT);
+    rt->PushAxisAlignedClip(R(pop.left + 2, pop.top + 4, w - 4, h - 8), D2D1_ANTIALIAS_MODE_ALIASED);
+    int* target = dropTarget;
+    for (int k = 0; k < m; k++) {
+        D2D1_RECT_F r = R(pop.left + 4, pop.top + 4 + k * DROP_ROW - dropScroll, w - (maxScroll > 0 ? 14 : 8), DROP_ROW - 2);
+        if (r.bottom < pop.top || r.top > pop.bottom) continue;
+        int v = items[k];
+        bool sel = *target == v, hover = In(R(r.left, r.top - 1, r.right - r.left, DROP_ROW)); // no dead gap between rows
+        if (hover) cursor = IDC_HAND;
+        if (hover && popPress) {
+            *target = v;
+            dropTarget = nullptr;
+            saveReq = true;
+        }
+        Fill(r, 6, sel ? ACCENT : hover ? BTN_HOVER : CARD);
+        if (v < 0) {
+            Text(L"None", R(r.left + 10, r.top, r.right - r.left - 20, r.bottom - r.top), fValue, sel ? WHITE : MUTED);
+            continue;
+        }
+        Text(*cfg.p[v].name ? cfg.p[v].name : L"Untitled", R(r.left + 10, r.top, r.right - r.left - 80, r.bottom - r.top), fValue,
+             sel ? WHITE : TEXT);
+        if (cfg.p[v].group)
+            Text(L"Group", R(r.right - 70, r.top, 60, r.bottom - r.top), fSmall, sel ? ACCENT_SOFT : ACCENT, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    }
+    rt->PopAxisAlignedClip();
+    if (maxScroll > 0) { // scrollbar
+        float vh = h - 8, th = vh * vh / (vh + maxScroll), ty = pop.top + 4 + (vh - th) * dropScroll / maxScroll;
+        Fill(R(pop.right - 7, ty, 3, th), 1.5f, MUTED, .6f);
+    }
 }
 
 // One line about a profile for the list: its pull and keys, or a group's slots (● = active) and their keys.
@@ -1603,6 +1676,18 @@ static void Frame(float W) {
     ACCENT = accents[cfg.accent][0];
     ACCENT_SOFT = accents[cfg.accent][1];
     rt->Clear(D2D1::ColorF(BG));
+    dropOn = false;
+    bool pressedAny = in.pressed, popPress = false;
+    float popWheel = 0;
+    if (dropTarget) { // an open dropdown list is on top: a click or scroll over it is only for it
+        int items[MAX_PROFILES + 1];
+        dropBlock = DropRect(DropItems(items));
+        dropOn = true;
+        if (InRaw(dropBlock)) {
+            popPress = in.pressed, popWheel = in.wheel;
+            in.pressed = false, in.wheel = 0;
+        }
+    }
     Profile& g = cfg.p[cfg.cur]; // the selected list entry: a profile or a group
     int runIdx = g.group ? SlotProfile(cfg, g, g.childSel) : cfg.cur; // whose pull settings show (-1: empty slot)
     Profile& p = cfg.p[runIdx >= 0 ? runIdx : cfg.cur];
@@ -1651,6 +1736,7 @@ static void Frame(float W) {
         D2D1_RECT_F t = R(TABS.left + 3 + k * 96.f, TABS.top + 3, 96, TABS.bottom - TABS.top - 6);
         if (Button(t) && tab != k) {
             tab = k;
+            dropTarget = nullptr;
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         if (tab == k) Fill(t, 6, ACCENT);
@@ -1662,7 +1748,7 @@ static void Frame(float W) {
     static int shownCur = -1, dragRow = -1; // dragRow: profile being dragged to a new place in the list
     static const wchar_t* const scopes[] = {L"All", L"Groups"};
     static const wchar_t* const shows[] = {L"All", L"Profiles", L"Groups"};
-    int vis[MAX_PROFILES], nv = VisibleProfiles(cfg, vis), curRow = 0;
+    int vis[MAX_PROFILES], nv = VisibleProfiles(cfg, vis), curRow = -1; // -1: the current one is filtered out
     for (int v = 0; v < nv; v++)
         if (vis[v] == cfg.cur) curRow = v;
     if (tab == 0) {
@@ -1688,7 +1774,7 @@ static void Frame(float W) {
         if (In(list) && in.wheel) scroll -= in.wheel * 38;
         if (cfg.cur != shownCur) {
             shownCur = cfg.cur;
-            scroll = std::clamp(scroll, curRow * 38.f + 34 - listH, curRow * 38.f);
+            if (curRow >= 0) scroll = std::clamp(scroll, curRow * 38.f + 34 - listH, curRow * 38.f);
         }
         scroll = std::clamp(scroll, 0.f, maxScroll);
         rt->PushAxisAlignedClip(list, D2D1_ANTIALIAS_MODE_ALIASED);
@@ -1720,18 +1806,14 @@ static void Frame(float W) {
             Fill(R(1233, ty, 3, th), 1.5f, MUTED, .5f);
         }
     } else if (tab == 1) {
-        // bar: step through the list without leaving the page, rename, list commands
-        for (int k = 0; k < 2; k++)
-            if (TextButton(k ? L"›" : L"‹", R(20 + k * 38.f, 64, 34, 34), nv > 1)) {
-                cfg.cur = vis[(curRow + (k ? 1 : nv - 1)) % nv];
-                saveReq = true;
-            }
-        NameField(g.name, NAME_LEN, R(100, 64, 250, 34), L"Untitled", L"Rename");
-        if (TextButton(L"Duplicate", R(360, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
-        if (TextButton(L"Delete", R(468, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
-        if (TextButton(L"Copy", R(560, 64, 72, 34))) profileCmd = 4;
-        if (TextButton(L"Paste", R(640, 64, 72, 34))) profileCmd = 5;
-        Text(L"Scroll: fine steps · click value: type · right-click: reset", R(720, 64, W - 740, 34), fSmall, MUTED,
+        // bar: pick what to edit, rename it, list commands
+        Dropdown(cfg.cur, R(20, 64, 250, 34), 1, false);
+        NameField(g.name, NAME_LEN, R(280, 64, 220, 34), L"Untitled", L"Rename");
+        if (TextButton(L"Duplicate", R(510, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
+        if (TextButton(L"Delete", R(618, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
+        if (TextButton(L"Copy", R(710, 64, 72, 34))) profileCmd = 4;
+        if (TextButton(L"Paste", R(790, 64, 72, 34))) profileCmd = 5;
+        Text(L"Scroll: fine steps · click value: type · right-click: reset", R(870, 64, W - 890, 34), fSmall, MUTED,
              DWRITE_TEXT_ALIGNMENT_TRAILING);
 
         // left column: keys (or the group's slots), then auto spam
@@ -1746,7 +1828,7 @@ static void Frame(float W) {
                 }
                 if (act) Circle(40, y + 16, 3.5f, GREEN);
                 Text(k ? L"Slot 2" : L"Slot 1", R(48, y, 46, 32), fLabel, act ? TEXT : MUTED);
-                ProfilePick(g.child[k], R(94, y, 150, 32), act);
+                Dropdown(g.child[k], R(94, y, 150, 32), 0, act);
                 KeyBind(L"", g.childKey[k], 250, y, 114, 114);
             }
             Text(L"Slot keys switch only while this group is active", R(36, 240, 328, 18), fSmall, MUTED);
@@ -1871,8 +1953,8 @@ static void Frame(float W) {
         cfg.switchGroups = sg;
         Text(L"Quick switch: hold it and press 1–9, or scroll", R(436, 414, 348, 18), fSmall, MUTED);
         Text(L"Wheel: aim, scroll or click to pick", R(436, 432, 348, 18), fSmall, MUTED);
-        Text(L"Groups: normal profiles are skipped (the list still", R(436, 450, 348, 18), fSmall, MUTED);
-        Text(L"shows the active one); 1–9 count groups only", R(436, 468, 348, 18), fSmall, MUTED);
+        Text(L"Groups: normal profiles are skipped, and 1–9", R(436, 450, 348, 18), fSmall, MUTED);
+        Text(L"count groups only", R(436, 468, 348, 18), fSmall, MUTED);
 
         Card(820, 64, 420, 460, L"GROUPS");
         KeyBind(L"Swap slot", cfg.swapKey, 836, 100, 388);
@@ -1893,6 +1975,8 @@ static void Frame(float W) {
         if (editTarget == numBuf) editTarget = nullptr;
         SyncCapture();
     }
+    DrawDropdown(popPress, popWheel, pressedAny && !popPress);
+    if (profileCmd) dropTarget = nullptr; // the list is about to change under it
     RunProfileCmd();
 
     if (dragRow >= 0) { // after the frame, like RunProfileCmd, so nothing moves mid-draw
