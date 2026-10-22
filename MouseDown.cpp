@@ -678,7 +678,11 @@ static bool Step(Trigger& t, int mode, bool combo, bool req, bool spamPulls, boo
     return ok && (spamPulls || (mode == 0 ? combo : mode == 1 ? t.latched && req : t.latched));
 }
 
+// A game keeping every core busy at a higher priority would leave a normal thread waiting for Windows'
+// anti-starvation boost, every few seconds: the pull started ~3 s late. Top priority costs next to nothing,
+// since the engine sleeps between ticks.
 static void Engine(HWND hwnd) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     std::mt19937 rng{std::random_device{}()};
     std::uniform_real_distribution<double> uni(-1, 1);
@@ -2757,6 +2761,12 @@ static IDWriteTextFormat* Font(float size, DWRITE_FONT_WEIGHT weight) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     timeBeginPeriod(1);
+    { // we're in the background while a game runs: don't let Windows slow us down or coarsen our timers for it
+        struct { ULONG version, control, state; } noThrottle{1, 0x1 | 0x4, 0}; // execution speed, timer resolution: off
+        using SetInfo = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+        if (auto set = (SetInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32"), "SetProcessInformation"))
+            set(GetCurrentProcess(), 4 /*ProcessPowerThrottling*/, &noThrottle, sizeof noThrottle);
+    }
     GetModuleFileNameW(nullptr, ini, MAX_PATH);
     wcsrchr(ini, L'\\')[1] = 0;
     wcscat_s(ini, L"settings.ini");
