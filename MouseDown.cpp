@@ -39,6 +39,9 @@ struct Profile {
     float growEvery = 0, growY = 0, growX = 0; // every growEvery ms held, pull gains growY/growX px/s (0 = off)
     float sway = 0, swayMs = 500; // horizontal sway: ±sway px/s, one full cycle every swayMs (0 = off)
     bool off[OFF_BITS] = {}; // per-feature switch (FieldDef::bit); off acts like the value is 0, keeping the value
+    // group ("parent profile"): pulls with the profile in its active slot; each slot has a key that picks it
+    bool group = false;
+    int child[2] = {-1, -1}, childKey[2] = {}, childSel = 0;
 };
 struct Config {
     Profile p[MAX_PROFILES];
@@ -115,6 +118,37 @@ static float Default(const FieldDef& d) {
     return d.f ? dp.*d.f : d.g ? dc.*d.g : d.lo;
 }
 
+// The normal profile a group's slot runs, or -1 if the slot is empty, out of range or (no nesting) a group.
+static int SlotProfile(const Config& c, const Profile& g, int slot) {
+    int ch = g.child[slot & 1];
+    return ch >= 0 && ch < c.n && !c.p[ch].group ? ch : -1;
+}
+
+// Keep group slots pointing at the same profiles when the list changes. map: old index -> new (-1 = gone).
+template <class F> static void RemapSlots(Config& c, F map) {
+    for (int i = 0; i < c.n; i++)
+        for (int& ch : c.p[i].child)
+            if (ch >= 0) ch = map(ch);
+}
+
+static void InsertProfile(Config& c, int at, Profile p) { // p by value: it may be a copy of one that moves
+    std::copy_backward(c.p + at, c.p + c.n, c.p + c.n + 1);
+    c.p[at] = p;
+    c.n++;
+    RemapSlots(c, [at](int i) { return i >= at ? i + 1 : i; });
+}
+
+static void DeleteProfile(Config& c, int at) {
+    std::copy(c.p + at + 1, c.p + c.n, c.p + at);
+    c.n--;
+    RemapSlots(c, [at](int i) { return i == at ? -1 : i > at ? i - 1 : i; });
+}
+
+static void SwapProfiles(Config& c, int a, int b) {
+    std::swap(c.p[a], c.p[b]);
+    RemapSlots(c, [a, b](int i) { return i == a ? b : i == b ? a : i; });
+}
+
 // The profile as the engine sees it: switched-off features read as 0.
 static Profile Effective(const Profile& p) {
     Profile e = p;
@@ -170,6 +204,12 @@ static void LoadSettings() {
         p.requireKey = (int)get(sec, L"requireKey", p.requireKey, 0, 254);
         p.hotkey = (int)get(sec, L"hotkey", p.hotkey, 0, 254);
         p.mode = (int)get(sec, L"mode", p.mode, 0, 2);
+        p.group = get(sec, L"group", 0, 0, 1) != 0;
+        p.child[0] = (int)get(sec, L"slot1", -1, -1, MAX_PROFILES - 1);
+        p.child[1] = (int)get(sec, L"slot2", -1, -1, MAX_PROFILES - 1);
+        p.childKey[0] = (int)get(sec, L"slot1Key", 0, 0, 254);
+        p.childKey[1] = (int)get(sec, L"slot2Key", 0, 0, 254);
+        p.childSel = (int)get(sec, L"slot", 0, 0, 1);
         for (auto& d : fields) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : growDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
         for (auto& d : swayDefs) p.*d.f = (float)get(sec, d.key, p.*d.f, d.lo, d.hi);
@@ -229,6 +269,14 @@ static void Save() {
         put(L"requireKey", p.requireKey);
         put(L"hotkey", p.hotkey);
         put(L"mode", p.mode);
+        if (p.group) {
+            put(L"group", 1);
+            put(L"slot1", p.child[0]);
+            put(L"slot2", p.child[1]);
+            put(L"slot1Key", p.childKey[0]);
+            put(L"slot2Key", p.childKey[1]);
+            put(L"slot", p.childSel);
+        }
         ForFields([&](const FieldDef& d) { put(d.key, p.*d.f); });
         ForSwitches([&](const FieldDef& d) { put((std::wstring(d.key) + L"Off").c_str(), p.off[d.bit]); });
     }
@@ -254,6 +302,13 @@ static std::wstring ExportProfile(const Profile& p) {
     add(L"holdKey", p.holdKey);
     add(L"requireKey", p.requireKey);
     add(L"mode", p.mode);
+    if (p.group) { // slots are list positions, so they only mean the same thing pasted on this PC
+        add(L"group", 1);
+        add(L"slot1", p.child[0]);
+        add(L"slot2", p.child[1]);
+        add(L"slot1Key", p.childKey[0]);
+        add(L"slot2Key", p.childKey[1]);
+    }
     ForFields([&](const FieldDef& d) { add(d.key, p.*d.f); });
     ForSwitches([&](const FieldDef& d) { add(std::wstring(d.key) + L"Off", p.off[d.bit]); });
     return s + L";name=" + p.name;
@@ -279,6 +334,11 @@ static bool ImportProfile(const wchar_t* s, Profile& p) {
             if (k == L"holdKey") q.holdKey = std::clamp((int)v, 0, 254);
             if (k == L"requireKey") q.requireKey = std::clamp((int)v, 0, 254);
             if (k == L"mode") q.mode = std::clamp((int)v, 0, 2);
+            if (k == L"group") q.group = v != 0;
+            if (k == L"slot1") q.child[0] = std::clamp((int)v, -1, MAX_PROFILES - 1);
+            if (k == L"slot2") q.child[1] = std::clamp((int)v, -1, MAX_PROFILES - 1);
+            if (k == L"slot1Key") q.childKey[0] = std::clamp((int)v, 0, 254);
+            if (k == L"slot2Key") q.childKey[1] = std::clamp((int)v, 0, 254);
             ForFields([&](const FieldDef& d) {
                 if (k == d.key) q.*d.f = (float)std::clamp(v, (double)d.lo, (double)d.hi);
                 if (d.bit >= 0 && k == std::wstring(d.key) + L"Off") q.off[d.bit] = v != 0;
@@ -292,7 +352,7 @@ static bool ImportProfile(const wchar_t* s, Profile& p) {
 
 // ---------- engine ----------
 
-enum { EV_ON = 1, EV_OFF, EV_PROFILE }; // wParam of WM_APP + 1
+enum { EV_ON = 1, EV_OFF, EV_PROFILE, EV_SLOT }; // wParam of WM_APP + 1
 
 // Physical key/button state from low-level hooks, which skip injected input. Our own spam clicks
 // would otherwise read as the user letting go (e.g. spamming Left Mouse while Left Mouse is held).
@@ -483,7 +543,8 @@ static void Engine(HWND hwnd) {
     int seenCur = -1, backCur = -1; // profile in use before the current one, for the last-profile key
     Trigger trig;
     bool hotWas[MAX_PROFILES] = {};
-    int lastCur = -1;
+    int lastCur = -1, lastRun = -1;
+    bool slotWas[2] = {};
     double vx = 0, vy = 0, ax = 0, ay = 0, jx = 1, jy = 1, nextJitter = 0, ox = 0, oy = 0, spamAt = 0, spamUpAt = 0;
     int spamVk = 0;         // key currently pressed by spam (0 = none)
     bool spamWas = false;
@@ -529,9 +590,24 @@ static void Engine(HWND hwnd) {
             PostMessageW(hwnd, WM_APP + 1, event, 0);
         }
 
-        const Profile p = Effective(c.p[c.cur]);
-        if (c.cur != lastCur || !c.enabled) trig.latched = false, wasActive = false; // a switch starts the new profile fresh
+        int run = c.cur; // the profile that pulls: a group hands this to the one in its active slot
+        if (c.p[c.cur].group) {
+            Profile& g = c.p[c.cur];
+            int sel = g.childSel;
+            for (int s = 0; s < 2; s++)
+                if (edge(g.childKey[s], slotWas[s])) sel = s;
+            if (sel != g.childSel) {
+                g.childSel = sel;
+                std::lock_guard<std::mutex> l(mu);
+                if (cfg.cur == c.cur && cfg.p[c.cur].group) cfg.p[c.cur].childSel = sel;
+                PostMessageW(hwnd, WM_APP + 1, EV_SLOT, 0);
+            }
+            run = SlotProfile(c, g, sel);
+        }
+        const Profile p = Effective(c.p[run >= 0 ? run : c.cur]);
+        if (c.cur != lastCur || run != lastRun || !c.enabled) trig.latched = false, wasActive = false; // a switch starts fresh
         lastCur = c.cur;
+        lastRun = run;
         QueryPerformanceCounter(&now);
         double nowMs = ms(now.QuadPart);
 
@@ -549,7 +625,8 @@ static void Engine(HWND hwnd) {
         bool spamPulls = spam && c.spamPull;
 
         bool req = !p.requireKey || Down(p.requireKey), restart;
-        bool active = Step(trig, p.mode, Down(p.holdKey) && req, req, spamPulls, c.enabled && !cap && !paused, wasActive, restart);
+        bool active = Step(trig, p.mode, Down(p.holdKey) && req, req, spamPulls, c.enabled && !cap && !paused && run >= 0, wasActive,
+                           restart);
         if (restart) wasActive = false;
         if (active != pulling) {
             pulling = active;
@@ -1122,8 +1199,8 @@ static void Slider(const FieldDef& d, float& v, float x, float y, float w, bool*
     Circle(x + w * f, ty, r - 2.5f, dim ? MUTED : TEXT);
 }
 
-static void KeyBind(const wchar_t* label, int& vk, float x, float y, float w) {
-    D2D1_RECT_F b = R(x + w - 136, y, 136, 32);
+static void KeyBind(const wchar_t* label, int& vk, float x, float y, float w, float bw = 136) { // bw: key box width
+    D2D1_RECT_F b = R(x + w - bw, y, bw, 32);
     bool waiting = bindTarget == &vk, hover = In(b);
     if (Button(b)) {
         bindTarget = &vk;
@@ -1131,7 +1208,7 @@ static void KeyBind(const wchar_t* label, int& vk, float x, float y, float w) {
         SyncCapture();
         SetTimer(hwnd, 1, 10, nullptr);
     }
-    Text(label, R(x, y, w - 140, 32), fLabel, TEXT);
+    if (*label) Text(label, R(x, y, w - bw - 4, 32), fLabel, TEXT);
     Fill(b, 8, hover || waiting ? BTN_HOVER : BTN);
     Stroke(b, 8, waiting ? ACCENT : BORDER, waiting ? 1.5f : 1);
     Text(waiting ? L"Press a key…" : KeyName(vk).c_str(), b, fValue, waiting ? ACCENT : vk ? TEXT : MUTED,
@@ -1234,24 +1311,64 @@ static void Preview(const Profile& p, double scale, float x, float y, float w, f
 static wchar_t toastReq[64]; // toast to show once the frame is done (the overlay can't draw mid-frame)
 static UINT32 toastReqColor;
 
+// "Group › Active slot" for a group, else the profile's name.
+static void ProfileLabel(const Config& c, int i, wchar_t* out, size_t cap) {
+    const Profile& g = c.p[i];
+    int ch = g.group ? SlotProfile(c, g, g.childSel) : -1;
+    const wchar_t* n = *g.name ? g.name : L"Untitled";
+    if (ch >= 0) swprintf_s(out, cap, L"%s › %s", n, *c.p[ch].name ? c.p[ch].name : L"Untitled");
+    else wcscpy_s(out, cap, n);
+}
+
+// Slot picker: ‹ name ›. The left half steps back, the right half (or the mouse wheel) forward, through
+// None and the normal profiles.
+static void ProfilePick(int& idx, D2D1_RECT_F b, bool active) {
+    bool hover = In(b);
+    auto step = [&](int dir) {
+        int k = idx < cfg.n ? idx : -1;
+        do {
+            k += dir;
+            if (k < -1) k = cfg.n - 1;
+            if (k >= cfg.n) k = -1;
+        } while (k >= 0 && cfg.p[k].group);
+        idx = k;
+        saveReq = true;
+    };
+    if (hover) cursor = IDC_HAND;
+    if (hover && in.pressed) step(in.mx < (b.left + b.right) / 2 ? -1 : 1);
+    if (hover && in.wheel) step(in.wheel > 0 ? -1 : 1);
+    bool ok = idx >= 0 && idx < cfg.n && !cfg.p[idx].group;
+    Fill(b, 8, hover ? BTN_HOVER : BTN);
+    Stroke(b, 8, active ? ACCENT : BORDER, active ? 1.5f : 1);
+    Text(ok ? (*cfg.p[idx].name ? cfg.p[idx].name : L"Untitled") : L"None", R(b.left + 18, b.top, b.right - b.left - 36, 32),
+         fValue, ok ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+    Text(L"‹", R(b.left + 7, b.top, 10, 32), fValue, MUTED);
+    Text(L"›", R(b.right - 15, b.top, 10, 32), fValue, MUTED);
+}
+
 static void RunProfileCmd() {
     Profile* p = cfg.p;
     int& n = cfg.n;
     int& cur = cfg.cur;
     if (profileCmd == 1 && n < MAX_PROFILES) { // new
-        p[n] = Profile{};
-        swprintf_s(p[n].name, L"Profile %d", n + 1);
-        cur = n++;
+        InsertProfile(cfg, n, Profile{});
+        swprintf_s(p[n - 1].name, L"Profile %d", n);
+        cur = n - 1;
+    } else if (profileCmd == 6 && n < MAX_PROFILES) { // new group, its slots on the first two normal profiles
+        InsertProfile(cfg, n, Profile{});
+        Profile& g = p[n - 1];
+        g.group = true;
+        swprintf_s(g.name, L"Group %d", n);
+        for (int i = 0, s = 0; i < n - 1 && s < 2; i++)
+            if (!p[i].group) g.child[s++] = i;
+        cur = n - 1;
     } else if (profileCmd == 2 && n < MAX_PROFILES) { // duplicate right after the current one
-        std::copy_backward(p + cur + 1, p + n, p + n + 1);
-        p[cur + 1] = p[cur];
+        InsertProfile(cfg, cur + 1, p[cur]);
         swprintf_s(p[cur + 1].name, L"%.15s copy", p[cur].name);
         p[cur + 1].hotkey = 0; // two profiles on one hotkey would fight
         cur++;
-        n++;
     } else if (profileCmd == 3 && n > 1) { // delete
-        std::copy(p + cur + 1, p + n, p + cur);
-        n--;
+        DeleteProfile(cfg, cur);
         cur = std::min(cur, n - 1);
     } else if (profileCmd == 4) { // copy
         CopyText(ExportProfile(p[cur]));
@@ -1276,7 +1393,9 @@ static void Frame(float W) {
     ACCENT = accents[cfg.accent][0];
     ACCENT_SOFT = accents[cfg.accent][1];
     rt->Clear(D2D1::ColorF(BG));
-    Profile& p = cfg.p[cfg.cur];
+    Profile& g = cfg.p[cfg.cur]; // the selected list entry: a profile or a group
+    int runIdx = g.group ? SlotProfile(cfg, g, g.childSel) : cfg.cur; // whose pull settings show (-1: empty slot)
+    Profile& p = cfg.p[runIdx >= 0 ? runIdx : cfg.cur];
 
     // header: title, clickable status pill, window buttons
     Text(L"Mouse Down", R(20, 0, 200, HEADER), fTitle, TEXT);
@@ -1334,18 +1453,23 @@ static void Frame(float W) {
         Fill(r, 8, sel ? ACCENT : hover || dragRow == i ? BTN_HOVER : CARD);
         if (i < 9) Text(std::to_wstring(i + 1).c_str(), R(r.left + 10, r.top, 14, 34), fSmall, sel ? ACCENT_SOFT : DISABLED);
         int hk = cfg.p[i].hotkey;
-        Text(*cfg.p[i].name ? cfg.p[i].name : L"Untitled", R(r.left + 26, r.top, hk ? 74.f : 126.f, 34), fLabel,
+        Text(*cfg.p[i].name ? cfg.p[i].name : L"Untitled", R(r.left + 26, r.top, hk || cfg.p[i].group ? 74.f : 126.f, 34), fLabel,
              sel ? WHITE : TEXT);
-        if (hk) Text(KeyName(hk).c_str(), R(r.right - 64, r.top, 54, 34), fSmall, sel ? ACCENT_SOFT : MUTED,
-                     DWRITE_TEXT_ALIGNMENT_TRAILING);
+        int ch = cfg.p[i].group ? SlotProfile(cfg, cfg.p[i], cfg.p[i].childSel) : -1;
+        std::wstring tail = hk ? KeyName(hk) : cfg.p[i].group ? L"› " + std::wstring(ch >= 0 ? cfg.p[ch].name : L"None") : L"";
+        if (!tail.empty()) Text(tail.c_str(), R(r.right - 64, r.top, 54, 34), fSmall, sel ? ACCENT_SOFT : MUTED,
+                                DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
     if (cfg.n < MAX_PROFILES) {
         D2D1_RECT_F r = R(28, 98 + cfg.n * 38.f - scroll, 164, 34);
-        bool hover = In(r) && In(list);
-        if (hover && Button(r)) profileCmd = 1;
-        if (hover) Fill(r, 8, BTN_HOVER);
-        Stroke(r, 8, BORDER);
-        Text(L"+  New profile", r, fValue, hover ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+        for (int k = 0; k < 2; k++) { // + Profile | + Group
+            D2D1_RECT_F b = R(28 + k * 84.f, r.top, 80, 34);
+            bool hover = In(b) && In(list);
+            if (hover && Button(b)) profileCmd = k ? 6 : 1;
+            if (hover) Fill(b, 8, BTN_HOVER);
+            Stroke(b, 8, BORDER);
+            Text(k ? L"+  Group" : L"+  Profile", b, fValue, hover ? TEXT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
+        }
     }
     rt->PopAxisAlignedClip();
     if (maxScroll > 0) { // scrollbar
@@ -1358,10 +1482,10 @@ static void Frame(float W) {
     Text(L"y", R(156, 438, 12, 18), fSmall, MUTED);
     Circle(170, 447, 3.5f, TEAL);
     Text(L"x", R(176, 438, 12, 18), fSmall, MUTED);
-    Preview(Effective(p), cfg.sens / 100, 36, 466, 148, 230);
+    if (runIdx >= 0) Preview(Effective(p), cfg.sens / 100, 36, 466, 148, 230);
 
     // profile bar
-    NameField(p.name, NAME_LEN, R(220, 64, 250, 34), L"Untitled", L"Rename");
+    NameField(g.name, NAME_LEN, R(220, 64, 250, 34), L"Untitled", L"Rename");
     if (TextButton(L"Duplicate", R(480, 64, 100, 34), cfg.n < MAX_PROFILES)) profileCmd = 2;
     if (TextButton(L"Delete", R(588, 64, 84, 34), cfg.n > 1, RED_SOFT)) profileCmd = 3;
     if (TextButton(L"Copy", R(680, 64, 72, 34))) profileCmd = 4;
@@ -1370,12 +1494,30 @@ static void Frame(float W) {
          DWRITE_TEXT_ALIGNMENT_TRAILING);
 
     // middle column
-    Card(220, 116, 300, 220, L"KEYS", L"Backspace clears");
-    KeyBind(L"Hold to pull", p.holdKey, 236, 152, 268);
-    KeyBind(L"Also require", p.requireKey, 236, 196, 268);
-    static const wchar_t* const modes[] = {L"Hold", L"Toggle", L"Tap"};
-    Segment(L"Activation", p.mode, modes, 236, 240, 268);
-    KeyBind(L"Profile hotkey", p.hotkey, 236, 284, 268);
+    if (g.group) { // slots: click the label to make it active; ‹ › picks the profile; then the slot's key
+        Card(220, 116, 300, 220, L"GROUP", L"Backspace clears");
+        for (int k = 0; k < 2; k++) {
+            float y = 152 + k * 44.f;
+            bool act = g.childSel == k;
+            if (Button(R(236, y, 54, 32))) {
+                g.childSel = k;
+                saveReq = true;
+            }
+            if (act) Circle(240, y + 16, 3.5f, GREEN);
+            Text(k ? L"Slot 2" : L"Slot 1", R(248, y, 46, 32), fLabel, act ? TEXT : MUTED);
+            ProfilePick(g.child[k], R(294, y, 114, 32), act);
+            KeyBind(L"", g.childKey[k], 414, y, 90, 90);
+        }
+        Text(L"Slot keys switch only while this group is active", R(236, 240, 268, 18), fSmall, MUTED);
+        Text(L"and still reach the game (bind your weapon keys)", R(236, 258, 268, 18), fSmall, MUTED);
+    } else {
+        Card(220, 116, 300, 220, L"KEYS", L"Backspace clears");
+        KeyBind(L"Hold to pull", p.holdKey, 236, 152, 268);
+        KeyBind(L"Also require", p.requireKey, 236, 196, 268);
+        static const wchar_t* const modes[] = {L"Hold", L"Toggle", L"Tap"};
+        Segment(L"Activation", p.mode, modes, 236, 240, 268);
+    }
+    KeyBind(L"Profile hotkey", g.hotkey, 236, 284, 268);
 
     Card(220, 348, 300, 464, L"GENERAL");
     KeyBind(L"On / off", cfg.toggleKey, 236, 384, 268);
@@ -1402,37 +1544,45 @@ static void Frame(float W) {
     }
 
     // right column
-    // Pull: tabs pick which stage's sliders show (stage 1 runs from activation), or the growth ones
-    static int stage;
-    static const wchar_t* const stages[] = {L"1", L"2", L"3", L"Grow"};
-    Card(540, 116, 380, 386, L"PULL");
-    Segment(L"Spray stage", stage, stages, 556, 152, 348);
-    const float segL = 556 + 348 - std::size(stages) * 58.f - 3; // left edge of the first tab
-    for (int s = 1; s < 4; s++) { // green dot over the tabs that are on
-        float on = s == 1 ? (p.off[6] ? 0 : p.at2) : s == 2 ? (p.off[7] ? 0 : p.at3) : (p.off[8] ? 0 : p.growEvery);
-        if (on > 0) Circle(segL + s * 58 + 50, 158, 3, GREEN);
-    }
-    auto PS = [&](const FieldDef& d, float x, float y, float w) { // profile slider, with its switch if it has one
-        Slider(d, p.*d.f, x, y, w, d.bit >= 0 ? &p.off[d.bit] : nullptr);
-    };
-    if (stage == 3) {
-        for (int i = 0; i < 3; i++) PS(growDefs[i], 556, 196 + i * 50.f, 348);
-    } else {
-        int base = stage ? 2 + (stage - 1) * 3 : 0;
-        PS(fields[base], 556, 196, 348);
-        PS(fields[base + 1], 556, 246, 348);
-        if (stage) PS(fields[base + 2], 556, 296, 348);
-        else Text(L"Runs from activation until stage 2 / 3 starts", R(556, 296, 348, 40), fSmall, MUTED);
-    }
-    PS(fields[STAGE_FIELDS], 556, 346, 348); // jitter
-    PS(fields[STAGE_FIELDS + 1], 556, 396, 164); // offset min/max: both switches flip the same flag
-    PS(fields[STAGE_FIELDS + 2], 740, 396, 164);
-    PS(swayDefs[0], 556, 452, 164); // sway amplitude (its switch) + period
-    PS(swayDefs[1], 740, 452, 164);
+    if (runIdx >= 0) {
+        // Pull: tabs pick which stage's sliders show (stage 1 runs from activation), or the growth ones
+        static int stage;
+        static const wchar_t* const stages[] = {L"1", L"2", L"3", L"Grow"};
+        wchar_t pullTitle[48] = L"PULL";
+        if (g.group) swprintf_s(pullTitle, L"PULL  ·  %s", *p.name ? p.name : L"Untitled"); // editing the active slot's profile
+        Card(540, 116, 380, 386, pullTitle);
+        Segment(L"Spray stage", stage, stages, 556, 152, 348);
+        const float segL = 556 + 348 - std::size(stages) * 58.f - 3; // left edge of the first tab
+        for (int s = 1; s < 4; s++) { // green dot over the tabs that are on
+            float on = s == 1 ? (p.off[6] ? 0 : p.at2) : s == 2 ? (p.off[7] ? 0 : p.at3) : (p.off[8] ? 0 : p.growEvery);
+            if (on > 0) Circle(segL + s * 58 + 50, 158, 3, GREEN);
+        }
+        auto PS = [&](const FieldDef& d, float x, float y, float w) { // profile slider, with its switch if it has one
+            Slider(d, p.*d.f, x, y, w, d.bit >= 0 ? &p.off[d.bit] : nullptr);
+        };
+        if (stage == 3) {
+            for (int i = 0; i < 3; i++) PS(growDefs[i], 556, 196 + i * 50.f, 348);
+        } else {
+            int base = stage ? 2 + (stage - 1) * 3 : 0;
+            PS(fields[base], 556, 196, 348);
+            PS(fields[base + 1], 556, 246, 348);
+            if (stage) PS(fields[base + 2], 556, 296, 348);
+            else Text(L"Runs from activation until stage 2 / 3 starts", R(556, 296, 348, 40), fSmall, MUTED);
+        }
+        PS(fields[STAGE_FIELDS], 556, 346, 348); // jitter
+        PS(fields[STAGE_FIELDS + 1], 556, 396, 164); // offset min/max: both switches flip the same flag
+        PS(fields[STAGE_FIELDS + 2], 740, 396, 164);
+        PS(swayDefs[0], 556, 452, 164); // sway amplitude (its switch) + period
+        PS(swayDefs[1], 740, 452, 164);
 
-    Card(540, 516, 380, 296, L"TIMING & SMOOTHING");
-    for (int i = PULL_FIELDS; i < (int)std::size(fields); i++)
-        PS(fields[i], 556, 552 + (i - PULL_FIELDS) * 50.f, 348);
+        Card(540, 516, 380, 296, L"TIMING & SMOOTHING");
+        for (int i = PULL_FIELDS; i < (int)std::size(fields); i++)
+            PS(fields[i], 556, 552 + (i - PULL_FIELDS) * 50.f, 348);
+    } else {
+        Card(540, 116, 380, 386, L"PULL");
+        Text(L"This slot is empty: pick a profile for it in the Group card", R(556, 152, 348, 32), fLabel, MUTED);
+        Card(540, 516, 380, 296, L"TIMING & SMOOTHING");
+    }
 
     // far right column
     Card(940, 116, 300, 362, L"AUTO SPAM");
@@ -1467,8 +1617,8 @@ static void Frame(float W) {
         } else {
             int to = std::clamp((int)std::floor((in.my - 98 + scroll) / 38), 0, cfg.n - 1);
             if (to != dragRow) cursor = IDC_SIZENS;
-            for (; dragRow < to; dragRow++) std::swap(cfg.p[dragRow], cfg.p[dragRow + 1]);
-            for (; dragRow > to; dragRow--) std::swap(cfg.p[dragRow], cfg.p[dragRow - 1]);
+            for (; dragRow < to; dragRow++) SwapProfiles(cfg, dragRow, dragRow + 1);
+            for (; dragRow > to; dragRow--) SwapProfiles(cfg, dragRow, dragRow - 1);
             if (cfg.cur != dragRow) {
                 cfg.cur = dragRow;
                 saveReq = true;
@@ -1642,6 +1792,7 @@ static void DrawWheel(float w, float) {
         wchar_t sub[32];
         swprintf_s(sub, L"%d", i + 1);
         if (p.hotkey) swprintf_s(sub, L"%d · %s", i + 1, KeyName(p.hotkey).c_str());
+        else if (int ch = p.group ? SlotProfile(cfg, p, p.childSel) : -1; ch >= 0) swprintf_s(sub, L"%d › %.12s", i + 1, cfg.p[ch].name);
         Text(sub, R(px - 52, py + 2, 104, 18), fSmall, t > .5f ? ACCENT_SOFT : MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
 
@@ -1654,7 +1805,9 @@ static void DrawWheel(float w, float) {
     const Profile& p = cfg.p[show];
     Text(*p.name ? p.name : L"Untitled", R(c - 62, c - 26, 124, 22), fValue, TEXT, DWRITE_TEXT_ALIGNMENT_CENTER);
     wchar_t stats[48];
-    swprintf_s(stats, L"↓%.0f  →%.0f", p.vy, p.vx);
+    int ch = p.group ? SlotProfile(cfg, p, p.childSel) : -1;
+    if (p.group) swprintf_s(stats, L"› %.20s", ch >= 0 ? cfg.p[ch].name : L"empty slot");
+    else swprintf_s(stats, L"↓%.0f  →%.0f", p.vy, p.vx);
     Text(stats, R(c - 62, c - 4, 124, 18), fSmall, MUTED, DWRITE_TEXT_ALIGNMENT_CENTER);
     Text(wheelSel < 0 ? L"aim or scroll" : wheelSel == cfg.cur ? L"current" : L"release or click", R(c - 62, c + 14, 124, 18),
          fSmall, wheelSel >= 0 && wheelSel != cfg.cur ? ACCENT : DISABLED, DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -1679,9 +1832,9 @@ static bool caretShown;
 
 // In-game HUD: active profile, its number and status, in the corner of the game's monitor.
 // Redrawn only when something on it changes.
-static wchar_t hudName[NAME_LEN + 4], hudSub[32];
+static wchar_t hudName[2 * NAME_LEN + 8], hudSub[32];
 static UINT32 hudColor;
-const float HUD_W = 250, HUD_H = 40;
+const float HUD_W = 300, HUD_H = 40;
 
 static void DrawHud(float w, float h) {
     Fill(R(0, 0, w, h), 10, CARD, .9f);
@@ -1695,7 +1848,7 @@ static void UpdateHud() {
     static bool shown;
     static LONG atX, atY;
     bool on, hud;
-    wchar_t name[NAME_LEN + 4], sub[32];
+    wchar_t name[2 * NAME_LEN + 8], sub[32];
     int cur, n;
     {
         std::lock_guard<std::mutex> l(mu);
@@ -1703,7 +1856,7 @@ static void UpdateHud() {
         on = cfg.enabled;
         cur = cfg.cur;
         n = cfg.n;
-        wcscpy_s(name, *cfg.p[cur].name ? cfg.p[cur].name : L"Untitled");
+        ProfileLabel(cfg, cur, name, std::size(name));
     }
     if (!hud) {
         if (shown) ShowWindow(hudWnd, SW_HIDE);
@@ -1793,7 +1946,7 @@ static void OverlayTick() {
     {
         std::lock_guard<std::mutex> l(mu);
         cfg.cur = wheelSel;
-        swprintf_s(msg, L"Profile: %s", cfg.p[cfg.cur].name);
+        ProfileLabel(cfg, cfg.cur, msg, std::size(msg));
         notify = cfg.notify;
         sound = cfg.sound;
     }
@@ -1922,7 +2075,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             std::lock_guard<std::mutex> l(mu);
             notify = cfg.notify;
             sound = cfg.sound;
-            if (wp == EV_PROFILE) swprintf_s(msg, L"Profile: %s", cfg.p[cfg.cur].name);
+            if (wp == EV_PROFILE || wp == EV_SLOT) ProfileLabel(cfg, cfg.cur, msg, std::size(msg));
             else wcscpy_s(msg, wp == EV_ON ? L"Enabled" : L"Disabled");
         }
         Save();
@@ -1978,6 +2131,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (saveReq) { // saved once things settle, not on every click, scroll step or keystroke
             saveReq = false;
             SetTimer(h, 3, 500, nullptr);
+            InvalidateRect(h, nullptr, FALSE); // the change happened mid-frame: draw it now, not on the next mouse move
         }
         if (*toastReq) {
             Notify(toastReq, toastReqColor);

@@ -77,11 +77,29 @@ int main() {
     assert(!wcscmp(b.name, L"A;b=c") && b.hotkey == 7);
     assert(!ImportProfile(L"garbage", b) && b.vy == 123);
 
+    // Groups: slots follow their profiles through inserts, moves and deletes; empty, out-of-range and
+    // nested (group) slots run nothing
+    Config gc;
+    gc.n = 3;
+    gc.p[2].group = true, gc.p[2].child[0] = 0, gc.p[2].child[1] = 1;
+    InsertProfile(gc, 1, Profile{});
+    assert(gc.n == 4 && gc.p[3].group && gc.p[3].child[0] == 0 && gc.p[3].child[1] == 2);
+    SwapProfiles(gc, 0, 3);
+    assert(gc.p[0].group && gc.p[0].child[0] == 3 && gc.p[0].child[1] == 2);
+    DeleteProfile(gc, 2);
+    assert(gc.n == 3 && gc.p[0].child[0] == 2 && gc.p[0].child[1] == -1);
+    assert(SlotProfile(gc, gc.p[0], 0) == 2 && SlotProfile(gc, gc.p[0], 1) == -1);
+    gc.p[0].child[1] = 7;
+    assert(SlotProfile(gc, gc.p[0], 1) == -1);
+    gc.p[2].group = true;
+    assert(SlotProfile(gc, gc.p[0], 0) == -1);
+
     // Settings survive a save and load, non-ASCII names and deleted profiles included
     GetTempPathW(MAX_PATH, ini);
     wcscat_s(ini, L"engine_check.ini");
     cfg.n = 3, cfg.cur = 2, cfg.prevKey = VK_F6, cfg.accent = 3, cfg.spamJitter = 12;
     cfg.p[1] = a;
+    cfg.p[0].group = true, cfg.p[0].child[0] = 1, cfg.p[0].childKey[1] = '2', cfg.p[0].childSel = 1;
     wcscpy_s(cfg.p[0].name, L"Spray ü");
     wcscpy_s(cfg.port, L"COM7");
     Save();
@@ -95,6 +113,8 @@ int main() {
     assert(cfg.n == 2 && cfg.cur == 1 && cfg.prevKey == VK_F6 && cfg.accent == 3 && cfg.spamJitter == 12);
     assert(cfg.p[1].vy == 123 && cfg.p[1].off[9] && !wcscmp(cfg.p[1].name, L"A;b=c") && !wcscmp(cfg.port, L"COM7"));
     assert(!wcscmp(cfg.p[0].name, L"Spray ü"));
+    assert(cfg.p[0].group && cfg.p[0].child[0] == 1 && cfg.p[0].child[1] == -1 && cfg.p[0].childKey[1] == '2' &&
+           cfg.p[0].childSel == 1 && !cfg.p[1].group);
     DeleteFileW(ini);
     puts("engine ok");
 }
