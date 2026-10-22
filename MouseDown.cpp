@@ -437,6 +437,7 @@ static std::mutex diagMu;
 static std::deque<std::string> diagLines;
 static LARGE_INTEGER diagFreq, diagT0;
 static std::atomic<int> diagWatch[4]; // hold, require, spam hold, spam require of the running profile
+static std::atomic<unsigned> injHook, injRaw; // our own injected mouse moves, as Windows hands them back to the hooks / raw input
 
 static void Diag(const char* fmt, ...) {
     if (!diagOn) return;
@@ -479,6 +480,7 @@ static bool Down(int vk);
 static LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
     static bool eatLUp; // the left press went to the wheel, so its release must too
     auto* m = (MSLLHOOKSTRUCT*)lp;
+    if (diagOn && code == HC_ACTION && wp == WM_MOUSEMOVE && (m->flags & LLMHF_INJECTED)) injHook++;
     if (code == HC_ACTION && !(m->flags & LLMHF_INJECTED)) {
         if (wp == WM_MOUSEMOVE && wheelShown) { // the wheel holds the mouse still: it steers the wheel, not the game
             POINT at;
@@ -567,7 +569,10 @@ static void RawSaw(int vk, bool down) {
 }
 
 static void HandleRaw(const RAWINPUT& ri) {
-    if (!ri.header.hDevice) return; // no device: injected
+    if (!ri.header.hDevice) { // no device: injected
+        if (diagOn && ri.header.dwType == RIM_TYPEMOUSE) injRaw++;
+        return;
+    }
     if (ri.header.dwType == RIM_TYPEMOUSE) {
         const RAWMOUSE& m = ri.data.mouse;
         rawMouse = true;
@@ -783,6 +788,10 @@ static void Engine(HWND hwnd) {
     int spamVk = 0;         // key currently pressed by spam (0 = none)
     int spamLast = 0;       // the key spam was clicking last tick, to hand back to the game when it stops
     bool movedYet = false;  // diagnostic log: whether this pull has sent its first move yet
+    long mvN = 0, mvX = 0, mvY = 0; // diagnostic log: moves sent since the last report
+    unsigned mvHook0 = 0, mvRaw0 = 0;
+    double repAt = 0;
+    int reps = 0;
     bool spamWas = false;
     double spamSince = -1; // when the spam keys went down (-1 = not held)
     Config c;
@@ -910,6 +919,11 @@ static void Engine(HWND hwnd) {
                 };
                 ox = offset();
                 oy = offset();
+                mvN = mvX = mvY = 0;
+                mvHook0 = injHook;
+                mvRaw0 = injRaw;
+                repAt = 250;
+                reps = 0;
                 if (serial == INVALID_HANDLE_VALUE && *c.port && !serialOpening) { // (re)connect, off this thread:
                     serialOpening = true;                                          // a stuck port can take seconds
                     std::thread([port = std::wstring(c.port)] {
@@ -952,6 +966,9 @@ static void Engine(HWND hwnd) {
             if (ix || iy) {
                 ax -= ix;
                 ay -= iy;
+                mvN++;
+                mvX += ix;
+                mvY += iy;
                 if (serial != INVALID_HANDLE_VALUE) { // real USB mouse: the game can't tell it from hardware
                     unsigned char pkt[3] = {0x80, (unsigned char)(char)ix, (unsigned char)(char)iy};
                     DWORD wr;
@@ -970,6 +987,17 @@ static void Engine(HWND hwnd) {
                     movedYet = true;
                     TimedSend(&in, "pull move");
                 }
+            }
+            if (diagOn && reps < 20 && tm >= repAt) { // the first 5 s of the pull, 4 times a second
+                POINT cur;
+                GetCursorPos(&cur);
+                Diag("pull    +%.0f ms: sent %ld moves (%ld, %ld); handed back to hooks %u, to raw input %u; cursor %ld,%ld",
+                     tm, mvN, mvX, mvY, injHook - mvHook0, injRaw - mvRaw0, cur.x, cur.y);
+                mvN = mvX = mvY = 0;
+                mvHook0 = injHook;
+                mvRaw0 = injRaw;
+                repAt += 250;
+                reps++;
             }
         }
 
